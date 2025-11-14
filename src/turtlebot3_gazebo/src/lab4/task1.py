@@ -4,13 +4,15 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image, LaserScan
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from cv_bridge import CvBridge
 import cv2 as cv
 import numpy as np
 import time
+import math
 
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
+
 
 # Import other python packages that you think necessary
 
@@ -25,46 +27,25 @@ class Task1(Node):
         # Subscribers
         #self.create_subscription(Image, '/camera/image_raw', self.listener_callback, 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
-
+        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
 
         # Publisher
         self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         self.bridge = CvBridge()
 
-
         self.timer = self.create_timer(0.1, self.timer_cb)
         # Fill in the initialization member variables that you need
-
-        # Wall following
-        self.front_distance = 5.0
-        self.right_distance = 5.0
-        self.left_distance = 5.0
-
-        self.prev_right_distance = 5.0
-        self.desired_wall_dist = 1.0
-        self.k_wall = 0.5
-        self.wall_follow_speed = 0.15
-
-
-        # Random 
-        self.last_random_change = time.time()
-        self.random_interval = 8.0
-        self.random_bias = 0.0
-
 
         # Modes
         self.mode = "EXPLORE"
         self.spin_start_time = time.time()
         self.spin_duration = 2.0      # seconds to spin in place (25)
 
-        # Sweep control
-        self.last_sweep_time = time.time()
-        self.sweep_interval = 200.0
-        self.sweep_duration = 10.0
-        self.is_sweeping = False
-        self.sweep_start_time = 0.0
-        self.sweep_type = None  # "room" or "periodic"
+        # Robot pose
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_yaw = 0.0
 
         # Map
         self.map_data = None
@@ -72,6 +53,10 @@ class Task1(Node):
         self.map_height = 0
         self.map_res = 0.05
         self.map_origin = (0, 0)
+
+        # Frontiers
+        self.visited_frontiers = set()
+        self.last_target = None
 
         self.get_logger().info('✅ Map started...')
 
@@ -102,6 +87,20 @@ class Task1(Node):
 
         self.ranges_full = ranges
         print("min front:", self.front, "min left:", self.left, "min right:", self.right)
+
+    def odom_callback(self, msg):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+
+        q = msg.pose.pose.orientation
+        siny = 2 * (q.w*q.z + q.x*q.y)
+        cosy = 1 - 2 * (q.y*q.y + q.z*q.z)
+        self.robot_yaw = math.atan2(siny, cosy)
+
+        #self.get_logger().info(
+        #    f"ODOM pose: ({self.robot_x:.2f}, {self.robot_y:.2f}), yaw={self.robot_yaw:.2f}"
+        #)
+
 
     def map_callback(self, msg):
         self.map_data = np.array(msg.data).reshape(msg.info.height, msg.info.width)
@@ -137,19 +136,61 @@ class Task1(Node):
         rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
 
         # --- Choose nearest frontier ---
-        target_grid = min(frontier_cells, key=lambda f: (f[0]-rx)**2 + (f[1]-ry)**2)
+        valid_frontiers = [f for f in frontier_cells if f not in self.visited_frontiers]
+
+        if not valid_frontiers:
+            self.get_logger().info("💤 All frontiers visited — resetting")
+            self.visited_frontiers.clear()
+            valid_frontiers = frontier_cells
+
+        target_grid = min(valid_frontiers, key=lambda f: (f[0]-rx)**2 + (f[1]-ry)**2)
+        self.last_target = target_grid
         tx, ty = target_grid
 
         # Convert target to world
         wx, wy = self.grid_to_world(tx, ty)
 
-        self.get_logger().info(f"🎯 Nearest frontier (grid): {target_grid}")
-        self.get_logger().info(f"🌍 Nearest frontier (world): ({wx:.2f}, {wy:.2f})")
+        #self.get_logger().info(f"🎯 Nearest frontier (grid): {target_grid}")
+        #self.get_logger().info(f"🌍 Nearest frontier (world): ({wx:.2f}, {wy:.2f})")
 
-        # Robot still does NOT move yet
+        # --- Step 3: Rotate toward target ---
+        vel = self.rotate_toward(wx, wy)
+        if vel is not None:
+            return vel  # still rotating
+
+        # --- Step 4: Move toward target once aligned ---
+        dx = wx - self.robot_x
+        dy = wy - self.robot_y
+        dist = math.hypot(dx, dy)
+
+        # Safety: stop for obstacles
+        if hasattr(self, "front") and self.front < 0.35:
+            stop = Twist()
+            stop.angular.z = 0.6   # turn away a little
+            stop.linear.x = 0.0
+            self.get_logger().info("🚫 Obstacle ahead — turning")
+            return stop
+
+        # If close to frontier, stop and allow new goal selection next cycle
+        if dist < 0.05:     # ~15 cm
+            stop = Twist()
+            self.get_logger().info("🎉 Reached frontier region!")
+            self.visited_frontiers.add(self.last_target)
+            self.last_target = None
+            return stop
+
+            return stop
+
+        # Otherwise move forward
+        vel = Twist()
+        vel.linear.x = 0.10          # forward speed
+        vel.angular.z = 0.0
+
+        self.get_logger().info(f"➡ Moving toward frontier. dist={dist:.2f}m")
+
         return vel
 
-    
+
     
     def grid_to_world(self, gx, gy):
         wx = self.map_origin[0] + gx * self.map_res
@@ -160,6 +201,36 @@ class Task1(Node):
         gx = int((wx - self.map_origin[0]) / self.map_res)
         gy = int((wy - self.map_origin[1]) / self.map_res)
         return gx, gy
+
+    def rotate_toward(self, wx, wy):
+        vel = Twist()
+
+        dx = wx - self.robot_x
+        dy = wy - self.robot_y
+
+        target_angle = math.atan2(dy, dx)
+        yaw_error = target_angle - self.robot_yaw
+        yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
+
+        # === Stop when close enough ===
+        if abs(yaw_error) < 0.20:   # wider threshold
+            self.get_logger().info(f"✔ Aligned with frontier (yaw_error={yaw_error:.2f})")
+            return None
+
+        # === Proportional turn for stability ===
+        k = 1.2
+        turn_rate = k * yaw_error
+
+        # Limit angular velocity
+        turn_rate = np.clip(turn_rate, -0.6, 0.6)
+
+        vel.angular.z = turn_rate
+        vel.linear.x = 0.0
+
+        self.get_logger().info(f"↻ Rotating... yaw_error={yaw_error:.2f}, cmd={turn_rate:.2f}")
+
+        return vel
+
 
 
 

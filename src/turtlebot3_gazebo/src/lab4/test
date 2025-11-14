@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+
+from sensor_msgs.msg import Image, LaserScan
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from cv_bridge import CvBridge
+import cv2 as cv
+import numpy as np
+import time
+import math
+
+from nav_msgs.msg import OccupancyGrid
+
+# Import other python packages that you think necessary
+
+
+class Task1(Node):
+    """
+    Environment mapping task.
+    """
+    def __init__(self):
+        super().__init__('task1_node')
+
+        # Subscribers
+        #self.create_subscription(Image, '/camera/image_raw', self.listener_callback, 10)
+        self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
+        self.create_subscription(PoseWithCovarianceStamped,
+            '/amcl_pose', self.amcl_callback, 10)
+        self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
+
+        # Publisher
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.bridge = CvBridge()
+
+
+        self.timer = self.create_timer(0.1, self.timer_cb)
+        # Fill in the initialization member variables that you need
+
+        # Wall following
+        self.front_distance = 5.0
+        self.right_distance = 5.0
+        self.left_distance = 5.0
+
+        self.prev_right_distance = 5.0
+        self.desired_wall_dist = 1.0
+        self.k_wall = 0.5
+        self.wall_follow_speed = 0.15
+
+
+        # Random 
+        self.last_random_change = time.time()
+        self.random_interval = 8.0
+        self.random_bias = 0.0
+
+        # Modes
+        self.mode = "EXPLORE"
+        self.spin_start_time = time.time()
+        self.spin_duration = 2.0      # seconds to spin in place (25)
+
+        # Sweep control
+        self.last_sweep_time = time.time()
+        self.sweep_interval = 200.0
+        self.sweep_duration = 10.0
+        self.is_sweeping = False
+        self.sweep_start_time = 0.0
+        self.sweep_type = None  # "room" or "periodic"
+
+        # Robot pose (we will fill these later)
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_yaw = 0.0
+        self.ttbot_pose = PoseStamped()
+
+        # Map
+        self.map_data = None
+        self.map_width = 0
+        self.map_height = 0
+        self.map_res = 0.05
+        self.map_origin = (0, 0)
+
+        self.get_logger().info('✅ Map started...')
+
+
+    def timer_cb(self):
+        #self.get_logger().info('Task1 node is alive.', throttle_duration_sec=1)
+        # Feel free to delete this line, and write your algorithm in this callback function
+        vel = Twist()
+
+        # -------------------- EXPLORE --------------------
+        if self.mode == "EXPLORE":
+            #vel = self.wall_following_behavior()
+            vel = self.frontiers()
+            #vel = self.vfh_explore()
+            self.publisher_.publish(vel)
+
+    # ---------------- LIDAR CALLBACK ----------------   
+    def scan_callback(self, msg):
+        ranges = np.array(msg.ranges)
+        ranges = np.where(np.isfinite(ranges), ranges, 10.0)
+
+        N = len(ranges)
+
+        # Use minimum, not mean — catches table legs
+        self.front = np.min(ranges[int(N*0.45):int(N*0.55)])
+        self.left  = np.min(ranges[int(N*0.25):int(N*0.45)])
+        self.right = np.min(ranges[int(N*0.55):int(N*0.75)])
+
+        self.ranges_full = ranges
+        print("min front:", self.front, "min left:", self.left, "min right:", self.right)
+
+    def amcl_callback(self, msg):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+
+        # quaternion → yaw
+        q = msg.pose.pose.orientation
+        siny = 2 * (q.w*q.z + q.x*q.y)
+        cosy = 1 - 2 * (q.y*q.y + q.z*q.z)
+        self.robot_yaw = math.atan2(siny, cosy)
+        
+        self.get_logger().info(f"AMCL pose: ({self.robot_x:.2f}, {self.robot_y:.2f}) yaw={self.robot_yaw:.2f}")
+
+
+    def map_callback(self, msg):
+        self.map_data = np.array(msg.data).reshape(msg.info.height, msg.info.width)
+        self.map_width = msg.info.width
+        self.map_height = msg.info.height
+        self.map_res = msg.info.resolution
+        self.map_origin = (msg.info.origin.position.x, msg.info.origin.position.y)
+
+    def frontiers(self):
+        vel = Twist()
+
+        if self.map_data is None:
+            return vel
+
+        M = self.map_data
+        H, W = self.map_height, self.map_width
+
+        frontier_cells = []
+
+        # --- Step 2 frontier detection ---
+        for y in range(1, H - 1):
+            for x in range(1, W - 1):
+                if M[y, x] == 0:
+                    nei = M[y-1:y+2, x-1:x+2]
+                    if np.any(nei == -1):
+                        frontier_cells.append((x, y))
+
+        if not frontier_cells:
+            self.get_logger().info("No frontiers!")
+            return vel
+
+        # --- Robot position in grid coords ---
+        rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
+
+        # --- Choose nearest frontier ---
+        target_grid = min(frontier_cells, key=lambda f: (f[0]-rx)**2 + (f[1]-ry)**2)
+        tx, ty = target_grid
+
+        # Convert target to world
+        wx, wy = self.grid_to_world(tx, ty)
+
+        self.get_logger().info(f"🎯 Nearest frontier (grid): {target_grid}")
+        self.get_logger().info(f"🌍 Nearest frontier (world): ({wx:.2f}, {wy:.2f})")
+
+        # Step 3: Rotate toward target (NO movement yet)
+        vel = self.rotate_toward(wx, wy)
+        if vel is not None:
+            return vel
+
+        # Aligned but DO NOT move yet
+        vel = Twist()
+        vel.angular.z = 0.0
+        vel.linear.x = 0.0
+        return vel
+
+    
+    def grid_to_world(self, gx, gy):
+        wx = self.map_origin[0] + gx * self.map_res
+        wy = self.map_origin[1] + gy * self.map_res
+        return wx, wy
+    
+    def world_to_grid(self, wx, wy):
+        gx = int((wx - self.map_origin[0]) / self.map_res)
+        gy = int((wy - self.map_origin[1]) / self.map_res)
+        return gx, gy
+
+    def rotate_toward(self, wx, wy):
+        vel = Twist()
+
+        dx = wx - self.robot_x
+        dy = wy - self.robot_y
+
+        target_angle = math.atan2(dy, dx)
+        yaw_error = target_angle - self.robot_yaw
+        yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
+
+        # === Stop when close enough ===
+        if abs(yaw_error) < 0.20:   # wider threshold
+            self.get_logger().info(f"✔ Aligned with frontier (yaw_error={yaw_error:.2f})")
+            return None
+
+        # === Proportional turn for stability ===
+        k = 1.2
+        turn_rate = k * yaw_error
+
+        # Limit angular velocity
+        turn_rate = np.clip(turn_rate, -0.6, 0.6)
+
+        vel.angular.z = turn_rate
+        vel.linear.x = 0.0
+
+        self.get_logger().info(f"↻ Rotating... yaw_error={yaw_error:.2f}, cmd={turn_rate:.2f}")
+
+        return vel
+
+    def __init__(self, node_name='Navigation'):
+        """! Class constructor.
+        @param  None.
+        @return An instance of the Navigation class.
+        """
+        super().__init__(node_name)
+        
+        # Load parameters
+        self.declare_parameter('map_file', '')
+
+        # Try to get map_file from ROS parameter
+        map_file = self.get_parameter('map_file').get_parameter_value().string_value
+
+        # If not provided, use local default
+        if not map_file:
+            # Change this path to your actual map YAML path
+            pkg_share = get_package_share_directory('task_4')
+            map_file = os.path.join(pkg_share, 'maps', 'sync_classroom_map.yaml')
+
+            self.get_logger().warn(f"No map_file parameter found. Using default: {map_file}")
+        else:
+            # If relative path, make it absolute (useful when running directly)
+            if not os.path.isabs(map_file):
+                map_file = os.path.join(os.getcwd(), map_file)  
+                self.declare_parameter('map_file', '')
+                map_file = self.get_parameter('map_file').get_parameter_value().string_value
+
+        # Initialize map processor
+        self.mp = MapProcessor(map_file)
+        kernel = self.mp.rect_kernel(11, 11)
+
+        self.mp.inflate_map(kernel, True)
+        self.mp.get_graph_from_map()
+
+        self.get_logger().info(f"Loaded map and created graph with {len(self.mp.map_graph.g)} nodes")
+        
+        # Initialize planner
+        self.astar = AStar(self.mp.map_graph)
+
+        # Initialize state variables
+        self.new_goal_received = False
+        self.reached_goal = False
+        self.current_pose = None
+        self.goal_pose = None
+        self.path = None
+        self.ttbot_pose_x = 0.0
+        self.ttbot_pose_y = 0.0
+        self.ttbot_yaw = 0.0
+        self.threshold = 0.2
+
+        # Path planner/follower related variables
+        self.path = Path()
+        self.goal_pose = PoseStamped()
+        self.ttbot_pose = PoseStamped()
+        self.start_time = 0.0
+
+        # Subscribers
+        self.create_subscription(PoseStamped, '/move_base_simple/goal', self.__goal_pose_cbk, 10)
+        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.__ttbot_pose_cbk, 10)
+
+        # Publishers
+        self.path_pub = self.create_publisher(Path, 'global_plan', 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.calc_time_pub = self.create_publisher(Float32, 'astar_time',10) #DO NOT MODIFY
+
+        # Node rate
+        self.rate = self.create_rate(10)
+
+    def __goal_pose_cbk(self, data):
+        # ! Callback to catch the goal pose.
+        # @param  data    PoseStamped object from RVIZ.
+        # @return None.
+        
+        print(">>> __goal_pose_cbk triggered <<<")
+        self.goal_pose = data
+        self.new_goal_received = True
+        self.get_logger().info(
+            'goal_pose: {:.4f}, {:.4f}'.format(self.goal_pose.pose.position.x, self.goal_pose.pose.position.y))
+    
+    def __ttbot_pose_cbk(self, data):
+        #print(">>> __ttbot_pose_cbk triggered <<<")
+        self.ttbot_pose_received = True
+        self.ttbot_pose = PoseStamped()
+        self.ttbot_pose.header = data.header
+        self.ttbot_pose.pose = data.pose.pose
+        #self.get_logger().info('ttbot_pose: {:.4f}, {:.4f}'.format(
+        #        self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y))
+
+    def a_star_path_planner(self, start_pose, end_pose):
+        # A* path planner: converts world <-> map and runs A* search.
+        path = Path()
+        self.get_logger().info(
+            f"A* planner.\n> start: {start_pose.pose.position},\n> end: {end_pose.pose.position}"
+        )
+
+        self.start_time = self.get_clock().now().nanoseconds * 1e-9
+
+        # --- Convert world → map ---
+        start_i, start_j = self.world_to_map(start_pose)
+        goal_i, goal_j = self.world_to_map(end_pose)
+
+        self.get_logger().info(f"Start node (map): {start_i},{start_j}, Goal node (map): {goal_i},{goal_j}")
+
+        # Ensure nodes exist in graph
+        start_i, start_j = self.nearest_free_node(start_i, start_j)
+        goal_i, goal_j = self.nearest_free_node(goal_i, goal_j)
+
+        start_key = f"{start_i},{start_j}"
+        goal_key = f"{goal_i},{goal_j}"
+
+        self.get_logger().info(f"Start node (map): {start_key}, Goal node (map): {goal_key}")
+
+        if start_key not in self.mp.map_graph.g or goal_key not in self.mp.map_graph.g:
+            self.get_logger().warn(f"Start or goal not in graph! ({start_key}, {goal_key})")
+            return path
+
+        # --- Run A* ---
+        astar_solver = AStar(self.mp.map_graph)
+        astar_solver.solve(self.mp.map_graph.g[start_key], self.mp.map_graph.g[goal_key])
+
+        try:
+            node_path = astar_solver.reconstruct_path(start_key, goal_key)
+        except KeyError:
+            self.get_logger().warn(f"Goal {goal_key} not reachable from start {start_key}")
+            return path
+        
+        # --- Convert back map → world ---
+        for node_name in node_path:
+            i, j = map(int, node_name.split(","))
+            pose = self.map_to_world(i, j)
+            path.poses.append(pose)
+
+        # After generating your path (e.g. nav_path)
+        print("\nPath in world coordinates:")
+        for i, pose_stamped in enumerate(path.poses):
+            pos = pose_stamped.pose.position
+            print(f"{i:>2}: (x={pos.x:.3f}, y={pos.y:.3f})")
+
+        # --- Autograder timing ---
+        self.astarTime = Float32()
+        self.astarTime.data = float(self.get_clock().now().nanoseconds * 1e-9 - self.start_time)
+        self.calc_time_pub.publish(self.astarTime)
+
+        return path
+    
+    def nearest_free_node(self, i, j):
+            print((f"{i},{j}"), " node in graph? ", (f"{i},{j}" in self.mp.map_graph.g))
+            #Return the nearest (i,j) that exists in the graph
+            if f"{i},{j}" in self.mp.map_graph.g:
+                return i, j
+            # Simple BFS search in 8-connected neighbors
+            from collections import deque
+            visited = set()
+            queue = deque([(i,j)])
+            while queue:
+                ci,cj = queue.popleft()
+                if f"{ci},{cj}" in self.mp.map_graph.g:
+                    return ci,cj
+                visited.add((ci,cj))
+                # 8 neighbors
+                for di in [-1,0,1]:
+                    for dj in [-1,0,1]:
+                        ni, nj = ci+di, cj+dj
+                        if 0<=ni<self.mp.map.image_array.shape[0] and 0<=nj<self.mp.map.image_array.shape[1]:
+                            if (ni,nj) not in visited:
+                                queue.append((ni,nj))
+            raise ValueError("No free nodes found nearby")
+    
+    def world_to_map(self, pose):
+        x, y = pose.pose.position.x, pose.pose.position.y
+        resx = self.mp.map.map_df.resolution[0]
+        resy = self.mp.map.map_df.resolution[0]        
+
+        # Extract origin correctly
+        origin_list = self.mp.map.map_df.origin.iloc[0]  # first element is the list [-0.29, -0.768, 0]
+        ox, oy = origin_list[0], origin_list[1]
+        i = self.mp.map.size[1] - int((y - oy) / resy)
+        j = int((x - ox) / resx)
+
+        return i, j
+
+    def map_to_world(self, i, j):
+        res = self.mp.map.map_df.resolution[0]
+        #res = 0.025
+
+        origin_list = self.mp.map.map_df.origin.iloc[0]
+        ox, oy = origin_list[0], origin_list[1]
+
+        x = j * res + ox 
+        #fix
+        y = (self.mp.map.size[1]-i) * res + oy 
+        pose = PoseStamped()
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        return pose
+  
+    def get_path_idx(self, path, vehicle_pose, last_idx=0):
+        vx = vehicle_pose.pose.position.x
+        vy = vehicle_pose.pose.position.y
+        lookahead = 0.3
+        for i in range(last_idx, len(path.poses)):
+            px = path.poses[i].pose.position.x
+            py = path.poses[i].pose.position.y
+            dist = math.hypot(px - vx, py - vy)
+            if dist > lookahead:
+                return i
+        return len(path.poses) - 1
+    
+    def quat_to_yaw(self, q):
+        """Convert quaternion to yaw (safe for ROS standard axes)."""
+        self.siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        self.cosy_cosp = 1 - 2 * (q.y**2 + q.z**2)
+        return math.atan2(self.siny_cosp, self.cosy_cosp)
+
+    def path_follower(self, vehicle_pose, current_goal_pose):
+        vx = vehicle_pose.pose.position.x
+        vy = vehicle_pose.pose.position.y
+        gx = current_goal_pose.pose.position.x
+        gy = current_goal_pose.pose.position.y
+
+        yaw = self.quat_to_yaw(vehicle_pose.pose.orientation)
+
+        desired_yaw = math.atan2(gy - vy, gx - vx)
+
+        # Compute heading error safely
+        heading_error = (desired_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
+
+        # distance to goal
+        dist = math.hypot(gx - vx, gy - vy)
+
+        # PID-like control
+        Kp_ang = 1.0   # proportional gain
+        Kd_ang = 0.2   # derivative gain (optional, helps damping)
+        Kp_lin = 0.5   # slow down when turning
+
+        # heading control
+        heading = Kp_ang * heading_error
+
+        # reduce speed when heading error is large
+        speed = max(0.05, min(0.2, Kp_lin * dist * math.cos(heading_error)))
+
+        return speed, heading, dist
+    
+    def smooth_path(self, path, window=3):
+        """Smooths a Path object by averaging positions over a sliding window."""
+        smoothed = Path()
+        n = len(path.poses)
+        for i in range(n):
+            x_sum, y_sum, count = 0, 0, 0
+            for j in range(max(0, i-window), min(n, i+window+1)):
+                x_sum += path.poses[j].pose.position.x
+                y_sum += path.poses[j].pose.position.y
+                count += 1
+            pose = PoseStamped()
+            pose.pose.position.x = x_sum / count
+            pose.pose.position.y = y_sum / count
+            smoothed.poses.append(pose)
+        return smoothed
+
+
+    def move_ttbot(self, speed, heading):
+        """! Function to move turtlebot passing directly a heading angle and the speed.
+        @param  speed     Desired speed.
+        @param  heading   Desired yaw angle.
+        @return path      object containing the sequence of waypoints of the created path.
+        """
+        cmd_vel = Twist()
+        # TODO: IMPLEMENT YOUR LOW-LEVEL CONTROLLER
+        cmd_vel.linear.x = speed
+        cmd_vel.angular.z = heading
+
+        self.cmd_vel_pub.publish(cmd_vel)
+
+    def move_ttbot_safe(self, speed, heading):
+
+        """Move the TurtleBot using linear speed and angular velocity."""
+        cmd_vel = Twist()
+        # Limit speed to reasonable ranges
+        cmd_vel.linear.x = max(min(speed, 0.2), 0.0)  # max 0.2 m/s
+        cmd_vel.angular.z = max(min(heading, 1.0), -1.0)  # max ±1 rad/s
+        self.cmd_vel_pub.publish(cmd_vel)
+    
+    def stop_robot(self):
+        cmd_vel = Twist()
+        cmd_vel.linear.x = 0.0
+        cmd_vel.angular.z = 0.0
+        self.cmd_vel_pub.publish(cmd_vel)
+
+    def show_map_and_path(self, path):
+        if path and len(path.poses) > 1:
+            # Convert world coords to map pixels
+            start = self.world_to_map(path.poses[0])
+            goal = self.world_to_map(path.poses[len(path.poses)-1])
+            # Draw and display
+            path_image = self.mp.draw_path_wrld(path, self.world_to_map)
+            map_size = self.mp.map.size
+            self.mp.display_map_with_path(path_image, map_size, start, goal)
+
+    def run(self):
+        """Main loop using get_path_idx() to follow waypoints intelligently."""
+        self.get_logger().info("Navigation node started, waiting for AMCL and goal updates...")
+        
+        self.new_goal_received = False  # Flag for new goal
+        self.ttbot_pose_received = False  # Flag for first AMCL pose
+        self.reached_goal = False
+
+        while rclpy.ok():
+            # Process callbacks
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+            # Wait for a new goal
+            if not self.new_goal_received:
+                continue
+
+            # Plan path once
+            path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
+            path = self.smooth_path(path, window=3)
+
+            self.get_logger().info(f"Planned path with {len(path.poses)} waypoints")
+            
+            # Show map + path before starting motion
+            self.show_map_and_path(path)
+            self.new_goal_received = False  # Reset goal flag
+
+            # Follow path using get_path_idx
+            last_idx = 0
+
+            while True:
+                rclpy.spin_once(self, timeout_sec=0.05)
+
+                idx = self.get_path_idx(path, self.ttbot_pose, last_idx)
+                current_goal = path.poses[idx]
+
+                if idx != last_idx:
+                    print("Pose:", idx, "/", len(path.poses), 
+                        "Current Goal: (", current_goal.pose.position.x, ",", current_goal.pose.position.y, ")")
+
+                speed, heading, dist = self.path_follower(self.ttbot_pose, current_goal)
+                self.move_ttbot(speed, heading)
+
+                last_idx = idx  # update
+
+                if idx >= len(path.poses) - 1 and dist < self.threshold:
+                    self.get_logger().info("Reached goal!")
+                    self.stop_robot()
+                    break
+
+                if self.new_goal_received:
+                    self.get_logger().info("New goal received! Replanning path...")
+                    break
+
+
+            self.rate.sleep()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    task1 = Task1()
+
+    try:
+        task1.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        task1.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
