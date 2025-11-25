@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""
-Explorer node — full rewrite for TurtleBot3 Waffle
-Features:
- - FSM-based explorer
- - Frontier queue + clustering + scoring
- - Reachability filtering on inflated map
- - Pure Pursuit local controller
- - Reactive vector-field obstacle avoidance + hard safety override
- - Robust lidar handling (angle-aware)
- - Conservative defaults tuned for TB3 Waffle
-"""
 
 import rclpy
 from rclpy.node import Node
+
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Twist
@@ -20,310 +10,422 @@ import numpy as np
 import math
 import time
 import heapq
-from collections import deque, defaultdict, namedtuple
-from typing import List, Tuple, Optional
+from collections import deque
 
-# ----------------- TUNABLE CONSTANTS (tune for robot) -----------------
-ROBOT = "turtlebot3_waffle"
 
-OCCUPIED_THRESH = 70        # occupancy grid >= this considered occupied
+# ---------- TUNABLE PARAMETERS ----------
+OCCUPIED_THRESH = 50          # occupancy grid value >= this is considered an obstacle
 UNKNOWN_VAL = -1
-INFLATE_RADIUS = 4          # grid cells (you said 4 works)
-MAP_RES_DEFAULT = 0.05
+INFLATE_RADIUS = 4.2            # smaller by default; adjust if robot footprint requires
+GOAL_NEAR_DIST_M = 0.15       # when within this world distance to goal waypoint, pop waypoint
+ALIGN_ANGLE = 0.20            # radians: how close to aligned before driving forward
+MAX_LINEAR_SPEED = 0.4
+MAX_ANGULAR_SPEED = 0.6
+OBSTACLE_FRONT_THRESH = 0.40  # meters
+REPLAN_INTERVAL = 1.0         # seconds between forced replans
+STUCK_TIME = 4.0              # seconds to consider stuck
+STUCK_MOVE_THRESH = 0.05      # meters moved to consider not stuck
+BACKUP_TIME = 0.6             # seconds to back up on recovery
+RECOVERY_ROTATE_TIME = 1.0    # seconds to rotate during recovery
+MIN_FRONTIER_GRID_DIST = 6    # minimum grid cells away from robot to accept frontier
+MAX_FRONTIER_DIST_M = 18.0   # allow farther goals
+LAMBDA_DIST = 0.35           # lower penalty for distance
+# ----------------------------------------
 
-# Pure Pursuit controller
-LOOKAHEAD_M = 0.25          # lookahead distance in meters
-MAX_LINEAR_SPEED = 0.25     # conservative for TB3 Waffle
-MAX_ANGULAR_SPEED = 1.2
-GOAL_NEAR_DIST_M = 0.15
-MIN_GOAL_DIST = 4
 
-# Planner tuning
-REPLAN_INTERVAL = 1.0
-MIN_FRONTIER_GRID_DIST = 6  # cells
-FAILED_FRONTIER_LIMIT = 3
-FAILED_CLEAR_TIME = 20.0
+class Task1(Node):
 
-# Reactive safety
-STOP_DIST = 0.30            # absolute hard-stop forward (m)
-SLOW_DIST = 0.6             # start steering & slow (m)
-AVOID_SPEED = 0.06
-THIN_OVERRIDE = 0.18        # treat very near single rays as thin obstacles
-
-# Stuck detection / recovery
-STUCK_MOVE_THRESH = 0.05
-STUCK_TIME = 4.0
-BACKUP_TIME = 0.6
-RECOVERY_ROTATE_TIME = 1.0
-REAR_BLOCK_DIST = 0.20
-
-# Misc
-TIMER_PERIOD = 0.1          # seconds
-SCAN_MAX_RANGE_DEFAULT = 10.0
-SCAN_ANGLE_OFFSET = 0.0     # if your lidar 0 is not forward, set offset (radians)
-# ----------------------------------------------------------------------
-
-Frontier = namedtuple("Frontier", ["cells", "centroid", "score", "visited", "failed_count"])
-
-class Explorer(Node):
     def __init__(self):
-        super().__init__('explorer_node')
+        super().__init__('task1_node')
 
-        # Subscribers & publishers
+        # Subscribers
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.timer = self.create_timer(TIMER_PERIOD, self.timer_cb)
 
-        # pose / odom
+        # Publisher
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.timer = self.create_timer(0.1, self.timer_cb)
+
+        # Robot pose
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
-        self.odom_received = False
 
-        # map
-        self.map_data: Optional[np.ndarray] = None
-        self.inflated_map: Optional[np.ndarray] = None
+        # robot footprint (tune to your robot)
+        self.robot_radius_m = 0.18   # ~18 cm radius (change if needed)
+        # robot_radius in grid cells (computed after map arrives)
+        self.robot_radius_cells = None
+        # clearance map (distance in cells to nearest inflated obstacle)
+        self.clearance_map = None
+
+        # Map
+        self.map_data = None
+        self.inflated_map = None
         self.map_width = 0
         self.map_height = 0
-        self.map_res = MAP_RES_DEFAULT
+        self.map_res = 0.05
         self.map_origin = (0.0, 0.0)
-        self.map_seq = 0
+        self.map_seq = 0  # increment on map 
 
-        # lidar
-        self.ranges_full: Optional[np.ndarray] = None
-        self.front = SCAN_MAX_RANGE_DEFAULT
-        self.left = SCAN_MAX_RANGE_DEFAULT
-        self.right = SCAN_MAX_RANGE_DEFAULT
-        self.scan_angle_min = 0.0
-        self.scan_angle_inc = 0.0
-        self.scan_n = 0
+        # LIDAR
+        self.front = 10.0
+        self.left = 10.0
+        self.right = 10.0
+        self.ranges_full = None
 
-        # planner state
-        self.current_path: List[Tuple[int,int]] = []
-        self.current_path_world: List[Tuple[float,float]] = []
-        self.path_goal: Optional[Tuple[int,int]] = None
+        # Planner state
+        self.current_path = []          # list of waypoints in grid (gx,gy)
+        self.current_path_world = []    # list of waypoints in world coords (wx,wy)
+        self.path_goal = None           # grid goal (gx,gy)
         self.last_plan_time = 0.0
 
-        # frontier management
-        self.frontier_queue: List[Tuple[float, Tuple[int,int]]] = []  # (neg_score, centroid_grid)
-        self.frontier_map = {}  # centroid -> Frontier
-        self.frontier_seq = None
-
-        # visited frontiers and failed counters
-        self.visited_mask: Optional[np.ndarray] = None
-        self.VISITED_RADIUS = int(0.5 / self.map_res) if self.map_res else 10
-        self.failed_frontiers = defaultdict(int)
-        self.failed_timestamps = {}
-
-        # stuck and oscillation
-        self.last_pos = None
+        # Stuck detection
+        self.last_pos = (0.0, 0.0)
         self.last_movement_time = time.time()
         self.last_cmd = Twist()
 
-        # FSM state
-        self.state = "IDLE"  # IDLE, PLAN, FOLLOW_PATH, AVOID, RECOVERY, DONE
-        self.get_logger().info("Explorer node initialized (TB3 Waffle defaults).")
+        # oscillation detection (simple sign-flip detector)
+        self.last_turn_sign = 0
+        self.osc_count = 0
+        self.OSCILLATION_THRESHOLD = 4
+        self.OSCILLATION_COOLDOWN = 3.0
+        self.osc_last_time = 0.0
+        self.oscillating = False
+        self.osc_end = 0.0
 
-    # ------------------------ Main Timer / FSM ------------------------
+        # Recovery
+        self.recovering = False
+        self.recovery_end_time = 0.0
+        self.recovery_stage = None  # "backup" or "rotate"
+
+        # Exploration bias: persistent exploration direction in world coords (unit vector)
+        # Set to None initially; once we pick a first frontier we store the direction to keep going.
+        self.exploration_dir = None
+        self.EXPLORE_ANGLE_LIMIT = math.radians(70)   # cone +/- 60 degrees
+
+        # frontier visit bookkeeping
+        self.visited_mask = None           # numpy bool array same shape as map
+        self.VISITED_RADIUS = 10            # radius in grid cells to mark visited around goals (tune)
+        self.failed_frontiers = {}         # dict {(gx,gy): fail_count}
+        self.FAILED_LIMIT = 3              # after this many A* fails, temporarily ignore frontier
+        self.FAILED_CLEAR_TIME = 15.0      # seconds after which failed_frontiers entry may be dropped
+        self._failed_timestamps = {}       # {(gx,gy): last_fail_time}
+
+        # path-following helper
+        self.last_path_idx = 0
+        self.last_follow_time = time.time()
+        self.get_logger().info("Task 1 node started.")
+
+    # ---------------- TIMER LOOP ----------------
     def timer_cb(self):
         now = time.time()
 
-        # Top-level hard safety: if lidar missing or map missing behave reasonably
-        if self.ranges_full is None:
-            # can't make decisions without lidar -> stop and wait
-            self._publish_stop()
+        # ---------------- RECOVERY ----------------
+        if self._handle_recovery(now):
             return
 
-        # Hard safety override (instant) - prevents any forward motion if obstacle too close
-        hard = self.hard_safety_override()
-        if hard is not None:
-            self.cmd_pub.publish(hard)
-            self.last_cmd = hard
+        # ---------------- OSCILLATION ----------------
+        if self._handle_oscillation(now):
             return
 
-        # State transitions
-        if self.state == "IDLE":
-            if self.map_data is not None:
-                self.state = "PLAN"
-        elif self.state == "PLAN":
-            # only replan occasionally
-            if time.time() - self.last_plan_time > REPLAN_INTERVAL or not self.current_path:
-                planned = self._plan_once()
-                self.last_plan_time = time.time()
-                if planned:
-                    self.state = "FOLLOW_PATH"
-                else:
-                    # if no frontiers -> maybe map incomplete (wait) or done
-                    # check if any unknown remains reachable
-                    if self._any_reachable_unknown():
-                        # wait a bit and replan
-                        self.get_logger().info("No plan found now — will retry.")
-                        self.state = "PLAN"
-                    else:
-                        self.get_logger().info("🎉 No reachable unknowns found -> DONE")
-                        self.state = "DONE"
-        elif self.state == "FOLLOW_PATH":
-            # reactive avoidance check; if avoidance returns override, execute that
-            reactive = self.reactive_vector_override()
-            if reactive is not None:
-                self.cmd_pub.publish(reactive)
-                self.last_cmd = reactive
-                # Switch to AVOID briefly until obstacle cleared
-                self.state = "AVOID"
-                return
+        # ---------------- MAP NOT READY ----------------
+        if self.map_data is None:
+            self._publish_rotate()
+            return
 
-            if not self.current_path_world:
-                self.get_logger().info("Path exhausted -> PLAN")
-                self.state = "PLAN"
-                return
+        # ---------------- STUCK CHECK ----------------
+        if self._check_stuck(now):
+            return
 
-            cmd = self.pure_pursuit_control()
+        # ---------------- FOLLOW CURRENT PATH ----------------
+        if self.current_path and self.current_path_world:
+            # Use the improved follower from the Navigation lab
+            idx = self.get_path_idx(self.current_path_world, self.last_path_idx)
+            idx = max(0, min(idx, len(self.current_path_world)-1))
+            current_goal = self.current_path_world[idx]
+            speed, heading, dist = self.path_follower_from_xy(current_goal[0], current_goal[1])
+            # publish safe command
+            self.move_ttbot_safe(speed, heading)
+            self.last_cmd = Twist(); self.last_cmd.linear.x = speed; self.last_cmd.angular.z = heading
+            self.last_path_idx = idx
+
+            # If at end and close enough -> finish
+            if idx >= len(self.current_path_world) - 1 and dist < GOAL_NEAR_DIST_M:
+                self.get_logger().info("✅ Reached path goal grid={}, clearing path".format(self.path_goal))
+                gx, gy = self.path_goal if self.path_goal is not None else (None, None)
+                self.path_goal = None
+
+                # mark visited area on the visited_mask to avoid reselecting nearby frontiers
+                if self.visited_mask is not None and gx is not None:
+                    rr = self.VISITED_RADIUS
+                    H, W = self.map_height, self.map_width
+                    x0 = max(0, gx - rr); x1 = min(W, gx + rr + 1)
+                    y0 = max(0, gy - rr); y1 = min(H, gy + rr + 1)
+                    xs = np.arange(x0, x1)
+                    ys = np.arange(y0, y1)
+                    # efficient disk mask
+                    dx = xs.reshape(1, -1) - gx
+                    dy = ys.reshape(-1, 1) - gy
+                    d2 = dx*dx + dy*dy
+                    disk = d2 <= (rr*rr)
+                    # assign into visited_mask (note indexing visited_mask[y,x])
+                    self.visited_mask[y0:y1, x0:x1] |= disk
+
+                # reset exploration_dir (keep this)
+                self.exploration_dir = None
+
+                # clear path lists
+                self.current_path = []
+                self.current_path_world = []
+                self.last_path_idx = 0
+
+            return
+
+        # ---------------- PLAN NEW PATH ----------------
+        if now - self.last_plan_time > REPLAN_INTERVAL or not self.current_path:
+            if not self.plan_to_frontier(farthest=False):
+                self.get_logger().info("🎉 Map complete (or no reachable frontiers). Stopping.")
+                self.cmd_pub.publish(Twist())
+                return
+            # when we set current_path_world in plan_to_frontier we will smooth it there
+            self.last_plan_time = now
+
+        # Default: no motion
+        self.cmd_pub.publish(Twist())
+
+    def _handle_recovery(self, now):
+        if not self.recovering:
+            return False
+
+        # still in recovery
+        if now < self.recovery_end_time:
+            self.cmd_pub.publish(self.recovery_cmd())
+            return True
+
+        # exit recovery
+        self.recovering = False
+        self.recovery_stage = None
+        self.get_logger().info("🔁 Recovery finished, replanning.")
+        self._reset_path()
+        return False
+    
+    def _handle_oscillation(self, now):
+        if not self.oscillating:
+            return False
+
+        if now < self.osc_end:
+            cmd = Twist(); cmd.linear.x = 0.12
             self.cmd_pub.publish(cmd)
-            self.last_cmd = cmd
+            return True
 
-            # Stuck detection
-            if self._check_stuck(now):
-                self.state = "RECOVERY"
-                return
+        self.oscillating = False
+        return False
+    
+    def _publish_rotate(self):
+        cmd = Twist()
+        cmd.angular.z = 0.4
+        self.cmd_pub.publish(cmd)
 
-        elif self.state == "AVOID":
-            # run reactive velocity until clear
-            reactive = self.reactive_vector_override()
-            if reactive is not None:
-                self.cmd_pub.publish(reactive)
-                self.last_cmd = reactive
-            else:
-                # cleared -> resume following if path exists
-                if self.current_path_world:
-                    self.state = "FOLLOW_PATH"
-                else:
-                    self.state = "PLAN"
+    def _check_stuck(self, now):
+        if not hasattr(self, "last_cmd"):
+            return False
 
-        elif self.state == "RECOVERY":
-            cmd = self.recovery_cmd()
-            # always check reactive during recovery
-            reactive = self.reactive_vector_override()
-            if reactive is not None:
-                self.cmd_pub.publish(reactive)
-                self.last_cmd = reactive
-            else:
-                self.cmd_pub.publish(cmd)
-                self.last_cmd = cmd
-            # If recovery finished (recovering flag false), go to PLAN
-            if not self.recovering:
-                self.state = "PLAN"
+        if getattr(self.last_cmd, "linear", None) is None:
+            return False
 
-        elif self.state == "DONE":
-            # stop and stay
-            self._publish_stop()
-            return
+        if self.last_cmd.linear.x <= 0.03:
+            return False
 
-    # ------------------------ LIDAR processing ------------------------
-    def scan_callback(self, msg: LaserScan):
-        ranges = np.array(msg.ranges, dtype=float)
-        ranges = np.where(np.isfinite(ranges), ranges, SCAN_MAX_RANGE_DEFAULT)
+        dx = self.robot_x - self.last_pos[0]
+        dy = self.robot_y - self.last_pos[1]
+        moved = math.hypot(dx, dy)
+
+        if moved > STUCK_MOVE_THRESH:
+            self.last_movement_time = now
+            self.last_pos = (self.robot_x, self.robot_y)
+            return False
+
+        if now - self.last_movement_time > STUCK_TIME:
+            self.get_logger().warning("🛑 Stuck detected -> performing recovery")
+            self.start_recovery()
+            rc = self.recovery_cmd()
+            self.cmd_pub.publish(rc)
+            self.last_cmd = rc
+            return True
+
+        return False
+    
+    def _reset_path(self):
+        self.current_path = []
+        self.current_path_world = []
+        self.path_goal = None
+        self.last_path_idx = 0
+
+    # ---------------- LIDAR ----------------
+    def scan_callback_old(self, msg):
+        ranges = np.array(msg.ranges)
+        ranges = np.where(np.isfinite(ranges), ranges, 10.0)
         self.ranges_full = ranges
-        self.scan_angle_min = msg.angle_min + SCAN_ANGLE_OFFSET
-        self.scan_angle_inc = msg.angle_increment
-        self.scan_n = len(ranges)
+        N = len(ranges)
+        # front: central ±10-12% (robust to different lidar indexing)
+        i0 = int(N * 0.44); i1 = int(N * 0.56)
+        sector = ranges[i0:i1]
+        self.front = float(np.percentile(sector, 5))  # ignores single outliers
+        """if i0 <= i1:
+            self.front = float(np.min(ranges[i0:i1]))
+        else:
+            self.front = float(min(np.min(ranges[i0:]), np.min(ranges[:i1])))"""
+        # left/right sectors (20%-35% and 65%-80%)
+        self.left = float(np.min(ranges[int(N*0.20):int(N*0.35)]))
+        self.right = float(np.min(ranges[int(N*0.65):int(N*0.80)]))
+    
+    # ---------------- LIDAR ----------------
+    def scan_callback_old2(self, msg):
+        ranges = np.array(msg.ranges, dtype=float)
+        ranges = np.where(np.isfinite(ranges), ranges, 10.0)
+        self.ranges_full = ranges
+        N = len(ranges)
 
-        # get statistics for front/left/right using ±12° windows
+        # FRONT sector: central 12% (good for TB3)
+        i0 = int(0.44 * N)
+        i1 = int(0.56 * N)
+        front_sector = ranges[i0:i1]
+        # ignore outliers → more stable
+        self.front = float(np.percentile(front_sector, 5))
+
+        # SIDE sectors (use percentiles for stability)
+        left_sec  = ranges[int(0.20*N):int(0.35*N)]
+        right_sec = ranges[int(0.65*N):int(0.80*N)]
+
+        self.left  = float(np.percentile(left_sec,  10))
+        self.right = float(np.percentile(right_sec, 10))
+
+    def scan_callback(self, msg):
+        # Clean ranges
+        ranges = np.array(msg.ranges, dtype=float)
+        ranges = np.where(np.isfinite(ranges), ranges, 10.0)
+        self.ranges_full = ranges
+
+        angle_min = msg.angle_min
+        angle_inc = msg.angle_increment
+        N = len(ranges)
+
         def angle_to_idx(angle):
-            return int(round((angle - self.scan_angle_min) / self.scan_angle_inc))
+            return int((angle - angle_min) / angle_inc)
 
-        N = self.scan_n
-        if N == 0 or self.scan_angle_inc == 0:
-            return
+        # Define cardinal angles
+        FRONT = 0.0
+        LEFT  = math.pi/2
+        RIGHT = -math.pi/2
 
-        FRONT = 0.0; LEFT = math.pi/2; RIGHT = -math.pi/2
-        w = math.radians(12)
+        w = math.radians(12)   # ±12° window
 
-        def sector_stats(center):
-            i0 = angle_to_idx(center - w); i1 = angle_to_idx(center + w)
-            i0 %= N; i1 %= N
-            if i0 <= i1:
-                sec = ranges[i0:i1+1]
+        def median_in_sector(center_angle):
+            idx0 = angle_to_idx(center_angle - w)
+            idx1 = angle_to_idx(center_angle + w)
+
+            # clip indices
+            idx0 %= N
+            idx1 %= N
+
+            if idx0 <= idx1:
+                sector = ranges[idx0:idx1]
             else:
-                sec = np.concatenate((ranges[i0:], ranges[:i1+1]))
-            if sec.size == 0:
-                return SCAN_MAX_RANGE_DEFAULT, SCAN_MAX_RANGE_DEFAULT
-            return float(np.median(sec)), float(np.min(sec))
+                # wrap-around case (e.g., crossing the 0° boundary)
+                sector = np.concatenate((ranges[idx0:], ranges[:idx1]))
 
-        f_med, f_min = sector_stats(FRONT)
-        l_med, l_min = sector_stats(LEFT)
-        r_med, r_min = sector_stats(RIGHT)
+            return float(np.median(sector))
 
-        self.front = f_min if f_min < THIN_OVERRIDE else f_med
-        self.left = l_min if l_min < THIN_OVERRIDE else l_med
-        self.right = r_min if r_min < THIN_OVERRIDE else r_med
+        self.front = median_in_sector(FRONT)
+        self.left  = median_in_sector(LEFT)
+        self.right = median_in_sector(RIGHT)
 
-    # ------------------------ ODOM ------------------------
-    def odom_callback(self, msg: Odometry):
+
+
+    # ---------------- ODOM ----------------
+    def odom_callback(self, msg):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
-        siny = 2*(q.w * q.z + q.x * q.y)
+        siny = 2*(q.w*q.z + q.x*q.y)
         cosy = 1 - 2*(q.y*q.y + q.z*q.z)
         self.robot_yaw = math.atan2(siny, cosy)
-        if not self.odom_received:
-            self.odom_received = True
-            self.last_pos = (self.robot_x, self.robot_y)
-            self.last_movement_time = time.time()
 
-    # ------------------------ MAP ------------------------
-    def map_callback(self, msg: OccupancyGrid):
-        # robust parsing
-        try:
-            H = msg.info.height
-            W = msg.info.width
-            arr = np.array(msg.data, dtype=int)
-            if arr.size != H * W:
-                self.get_logger().warn(f"Map data size mismatch {arr.size} != {H}*{W}")
-                return
-            self.map_data = arr.reshape(H, W)
-        except Exception as e:
-            self.get_logger().error(f"Failed to parse map: {e}")
-            return
-
-        self.map_width = W
-        self.map_height = H
-        if msg.info.resolution and msg.info.resolution > 0:
-            self.map_res = msg.info.resolution
+    # ---------------- MAP ----------------
+    def map_callback(self, msg):
+        # msg.data is a flat list row-major. reshape to [height, width]
+        self.map_data = np.array(msg.data, dtype=int).reshape(msg.info.height, msg.info.width)
+        self.map_width = msg.info.width
+        self.map_height = msg.info.height
+        self.map_res = msg.info.resolution
         self.map_origin = (msg.info.origin.position.x, msg.info.origin.position.y)
-
+        # bump seq to notice map changes
         self.map_seq += 1
+
+        # build inflated map (binary grid) whenever map updates
         self.inflated_map = self.build_inflated_map(self.map_data, INFLATE_RADIUS)
 
-        # (re)initialize visited mask if needed
-        if self.visited_mask is None or self.visited_mask.shape != self.map_data.shape:
-            self.visited_mask = np.zeros_like(self.map_data, dtype=bool)
+        # compute integer clearance (BFS distance transform) in grid cells
+        def compute_clearance(inflated):
+            H, W = inflated.shape
+            INF = 10**9
+            dist = np.full((H, W), INF, dtype=int)
+            from collections import deque
+            q = deque()
+            ys, xs = np.where(inflated == 1)  # obstacles in inflated map
+            for y, x in zip(ys, xs):
+                dist[y, x] = 0
+                q.append((y, x))
 
-        # invalidate frontier cache so plan will recompute clusters
-        self.frontier_seq = None
+            # 4-connected BFS to compute Manhattan distance in cells
+            neigh = [(1,0),(-1,0),(0,1),(0,-1)]
+            while q:
+                y, x = q.popleft()
+                d = dist[y, x]
+                for dy, dx in neigh:
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < H and 0 <= nx < W and dist[ny, nx] == INF:
+                        dist[ny, nx] = d + 1
+                        q.append((ny, nx))
+            return dist
 
-    # ------------------------ MAP INFLATION ------------------------
-    def build_inflated_map(self, M: np.ndarray, radius_cells: int) -> np.ndarray:
+        # inside map_callback after building self.inflated_map:
+        self.clearance_map = compute_clearance(self.inflated_map)
+
+        # compute robot radius in cells (rounded up)
+        self.robot_radius_cells = max(1, int(math.ceil(self.robot_radius_m / (self.map_res if self.map_res>0 else 0.05))))
+        self.get_logger().info(f"robot_radius_cells={self.robot_radius_cells}")
+
+
+
+
+    # ---------------- INFLATION ----------------
+    def build_inflated_map(self, M, radius_cells):
         H, W = M.shape
-        binmap = (M >= OCCUPIED_THRESH).astype(np.uint8)
-        if radius_cells <= 0 or H < 3 or W < 3:
-            return binmap.copy()
+        binmap = np.zeros((H, W), dtype=np.uint8)
+        binmap[M >= OCCUPIED_THRESH] = 1
 
-        dist = np.full((H, W), -1, dtype=int)
+        if radius_cells <= 0:
+            return binmap
+
+        # Simple symmetric BFS distance-based inflation
         inflated = binmap.copy()
+        dist = np.full((H, W), -1, dtype=int)
         q = deque()
-        ys, xs = np.nonzero(binmap == 1)
-        for y, x in zip(ys, xs):
-            q.append((y, x)); dist[y, x] = 0
 
-        neighbors8 = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+        ys, xs = np.where(binmap == 1)
+        for y, x in zip(ys, xs):
+            q.append((y, x))
+            dist[y, x] = 0
+
+        offs = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
         while q:
             y, x = q.popleft()
             d = dist[y, x]
             if d >= radius_cells:
                 continue
-            for dy, dx in neighbors8:
+            for dy, dx in offs:
                 ny, nx = y + dy, x + dx
                 if 0 <= ny < H and 0 <= nx < W and dist[ny, nx] == -1:
                     dist[ny, nx] = d + 1
@@ -332,611 +434,544 @@ class Explorer(Node):
 
         return inflated
 
-    # ------------------------ FRONTIER CLUSTERING ------------------------
-    def _compute_frontiers(self) -> List[Frontier]:
+
+    # ---------------- FRONTIER / PLANNING HELPERS ----------------
+    def get_frontier_cells(self):
         """
-        Compute frontier clusters only when map_seq changed; returns list of Frontier
-        A frontier cell = free cell with any unknown neighbor.
-        Cluster adjacent frontier cells into connected components and compute centroid and cluster size.
+        Return list of free cells (x,y) that border unknown cells.
+        free cell: map_data[y,x] == 0
+        unknown cell: map_data[y,x] == UNKNOWN_VAL
         """
         if self.map_data is None:
             return []
 
-        # cache guard
-        if self.frontier_seq == self.map_seq and self.frontier_map:
-            return list(self.frontier_map.values())
-
+        frontiers = []
         M = self.map_data
         H, W = M.shape
-        unknown = (M == UNKNOWN_VAL)
-        free = (M == 0)
 
-        # compute frontier mask
-        neigh_unknown = np.zeros_like(M, dtype=bool)
-        shifts = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1),(0,0)]
-        for dy, dx in shifts:
-            neigh_unknown |= np.roll(np.roll(unknown, dy, axis=0), dx, axis=1)
-        frontier_mask = free & neigh_unknown
+        # don't check border cells (1..H-2, 1..W-2) for safety
+        for y in range(1, H-1):
+            for x in range(1, W-1):
+                # treat 0..30 as free-ish for SLAM maps
+                if not (0 <= M[y, x] <= 30):
+                    continue
+                # check 8-neighborhood for unknown
+                neigh = M[y-1:y+2, x-1:x+2]
+                if np.any(neigh == UNKNOWN_VAL):
+                    # avoid frontiers touching inflated obstacle
+                    if self.inflated_map is not None and np.any(self.inflated_map[y-1:y+2, x-1:x+2] == 1):
+                        continue
+                    frontiers.append((x, y))
+        return frontiers
 
-        # clear boundary
-        frontier_mask[0,:] = False; frontier_mask[-1,:] = False; frontier_mask[:,0] = False; frontier_mask[:,-1] = False
-
-        ys, xs = np.nonzero(frontier_mask)
-        cells = list(zip(xs.tolist(), ys.tolist()))  # grid (x,y)
-
-        # cluster via BFS over 8-connected frontier mask
-        frontier_map = {}
-        visited = set()
-        for (x0, y0) in cells:
-            if (x0, y0) in visited:
-                continue
-            # BFS
-            stack = [(x0, y0)]
-            comp = []
-            visited.add((x0, y0))
-            while stack:
-                x, y = stack.pop()
-                comp.append((x, y))
-                for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < W and 0 <= ny < H and frontier_mask[ny, nx] and (nx, ny) not in visited:
-                        visited.add((nx, ny)); stack.append((nx, ny))
-            # compute centroid
-            xs_comp = [c[0] for c in comp]; ys_comp = [c[1] for c in comp]
-            cx = int(round(sum(xs_comp) / len(xs_comp)))
-            cy = int(round(sum(ys_comp) / len(ys_comp)))
-            f = Frontier(cells=comp, centroid=(cx, cy), score=0.0, visited=False, failed_count=0)
-            frontier_map[(cx, cy)] = f
-
-        # replace cache
-        self.frontier_map = frontier_map
-        self.frontier_seq = self.map_seq
-        return list(frontier_map.values())
-
-    # ------------------------ REACHABILITY FILTER ------------------------
-    def _reachable_mask(self) -> Optional[np.ndarray]:
-        if self.inflated_map is None or self.map_data is None:
-            return None
-        H, W = self.inflated_map.shape
-        rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
-        if not (0 <= rx < W and 0 <= ry < H):
-            return None
-        if self.inflated_map[ry, rx] == 1:
-            # robot inside an obstacle in inflated map -> unreachable
-            return None
-        reachable = np.zeros_like(self.inflated_map, dtype=bool)
-        q = deque()
-        q.append((rx, ry))
-        reachable[ry, rx] = True
-        while q:
-            x, y = q.popleft()
-            for nx, ny in ((x+1,y),(x-1,y),(x,y+1),(x,y-1)):
-                if 0 <= nx < W and 0 <= ny < H and not reachable[ny, nx] and self.inflated_map[ny, nx] == 0:
-                    reachable[ny, nx] = True
-                    q.append((nx, ny))
-        return reachable
-
-    # ------------------------ FRONTIER SCORING ------------------------
-    def _score_frontier(self, frontier: Frontier, reachable_mask: np.ndarray) -> float:
+    def is_cell_free_inflated(self, gx, gy):
+        """Return True if inflated_map considers this cell free (0)."""
+        if self.inflated_map is None:
+            return False
+        if not (0 <= gx < self.map_width and 0 <= gy < self.map_height):
+            return False
+        return self.inflated_map[gy, gx] == 0
+    
+    def is_cell_traversable(self, gx, gy, min_clearance_cells=None):
         """
-        Score = information_gain (cluster size) * alignment + distance_penalty
-        alignment = dot of unit vector to centroid and robot heading
-        distance_penalty = 1/(1 + dist)
+        Return True if this cell has enough clearance to place the robot center.
+        min_clearance_cells: if None, use self.robot_radius_cells
         """
-        rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
-        cx, cy = frontier.centroid
-        # skip unreachable centroid
-        H, W = self.map_height, self.map_width
-        if not (0 <= cx < W and 0 <= cy < H) or not reachable_mask[cy, cx]:
-            return -1e9
+        if self.inflated_map is None or self.clearance_map is None:
+            return False
+        if not (0 <= gx < self.map_width and 0 <= gy < self.map_height):
+            return False
+        if min_clearance_cells is None:
+            min_clearance_cells = self.robot_radius_cells if self.robot_radius_cells is not None else 1
+        return self.clearance_map[gy, gx] >= min_clearance_cells
 
-        dx = cx - rx; dy = cy - ry
-        dist = math.hypot(dx, dy)
-        if dist < 1e-6:
-            dist = 1e-6
-        # alignment
-        ex = math.cos(self.robot_yaw); ey = math.sin(self.robot_yaw)
-        ux = dx / dist; uy = dy / dist
-        alignment = max(-1.0, min(1.0, ux*ex + uy*ey))
-        info_gain = len(frontier.cells)
-        score = info_gain * (0.5 + 0.5 * (alignment + 1) / 2.0) * (1.0 / (1.0 + dist))
-        return score
 
-    # ------------------------ PLAN ONCE (choose next frontier) ------------------------
-    def _plan_once(self) -> bool:
-        """
-        Selects the best frontier cluster, finds a safe target near its centroid,
-        ensures the goal is not trivial (too close to robot), and runs A*.
-        """
+    # -----------------------------------------------------
+    #      PLANNING: choose reachable frontier -> A*
+    # -----------------------------------------------------
+    def plan_to_frontier(self, farthest=False):
+        M = self.map_data
+        H, W = M.shape
+        if self.map_data is None or self.inflated_map is None:
+            return False
 
-        # 1. Compute frontier clusters
-        frontiers = self._compute_frontiers()
+        frontiers = self.get_frontier_cells()
+        self.get_logger().info(f"Frontiers found: {len(frontiers)}")
         if not frontiers:
             return False
+        
+        # Filter visited & failed frontiers
+        filtered_frontiers = []
+        now = time.time()
 
-        # 2. Compute reachability mask
-        reachable = self._reachable_mask()
-        if reachable is None:
-            self.get_logger().warn("Robot not in free space (inflated map) — cannot plan.")
-            return False
-
-        # 3. Prepare priority queue of candidate frontiers
-        pq = []
-        for f in frontiers:
-            cx, cy = f.centroid
-
-            # skip visited
-            if (
-                self.visited_mask is not None
-                and 0 <= cx < self.map_width
-                and 0 <= cy < self.map_height
-                and self.visited_mask[cy, cx]
-            ):
+        for fx, fy in frontiers:
+            # skip if visited
+            if self.visited_mask is not None and self.visited_mask[fy, fx]:
                 continue
 
-            score = self._score_frontier(f, reachable)
-            if score < -1e8:
-                continue
-
-            heapq.heappush(pq, (-score, (cx, cy)))  # max-heap via negative
-
-        if not pq:
-            return False
-
-        # ---- Robot grid position (compute once up front!) ----
-        rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
-        rx = int(rx)
-        ry = int(ry)
-
-        # ---- Planning loop: try candidates in ranked order ----
-        while pq:
-            negscore, (cx, cy) = heapq.heappop(pq)
-            score = -negscore
-
-            f = self.frontier_map.get((cx, cy))
-            if f is None:
-                continue
-
-            # Skip recently-failed frontiers
-            fail_count = self.failed_frontiers.get((cx, cy), 0)
-            if fail_count >= FAILED_FRONTIER_LIMIT:
-                ts = self.failed_timestamps.get((cx, cy), 0)
-                if time.time() - ts < FAILED_CLEAR_TIME:
-                    continue
+            # skip if failed too many times
+            fail_count = self.failed_frontiers.get((fx, fy), 0)
+            if fail_count >= self.FAILED_LIMIT:
+                # clear failed entry if stale
+                ts = self._failed_timestamps.get((fx, fy), 0)
+                if now - ts > self.FAILED_CLEAR_TIME:
+                    self.failed_frontiers.pop((fx, fy), None)
+                    self._failed_timestamps.pop((fx, fy), None)
                 else:
-                    self.failed_frontiers.pop((cx, cy), None)
-                    self.failed_timestamps.pop((cx, cy), None)
+                    continue
 
-            # 4. Find a safe target near frontier centroid
-            safe = self.find_safe_target_near_frontier(cx, cy, max_radius=8)
-            if safe is None:
-                self.failed_frontiers[(cx, cy)] += 1
-                self.failed_timestamps[(cx, cy)] = time.time()
+            filtered_frontiers.append((fx, fy))
+        
+        if not filtered_frontiers:
+            return False
+
+        # Robot grid
+        rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
+        F = np.array(filtered_frontiers, dtype=float)
+        dx = F[:, 0] - rx
+        dy = F[:, 1] - ry
+        dist = np.hypot(dx, dy)
+
+        # Direction preference
+        if self.exploration_dir is None:
+            ex, ey = (math.cos(self.robot_yaw), math.sin(self.robot_yaw))
+        else:
+            ex, ey = self.exploration_dir
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ux = np.where(dist > 0, dx / dist, 0.0)
+            uy = np.where(dist > 0, dy / dist, 0.0)
+
+        dots = ux * ex + uy * ey  # directional alignment score
+
+        # -----------------------
+        # NEW SCORING: prefer aligned & nearer frontiers
+        # -----------------------
+        # distance in meters
+        dist_m = dist * float(self.map_res)
+
+        # normalized distance [0..1]
+        dist_norm = np.clip(dist_m / (MAX_FRONTIER_DIST_M + 1e-6), 0.0, 1.0)
+
+        # score: favor alignment, penalize distance.
+        # Range roughly in [-1 - lambda, 1]
+        scores = dots - LAMBDA_DIST * dist_norm
+
+        # Hard reject: drop frontiers that are extremely far (optional)
+        far_mask = dist_m <= MAX_FRONTIER_DIST_M
+
+        # Keep ahead/weak logic based on alignment (dots)
+        cos_limit = math.cos(self.EXPLORE_ANGLE_LIMIT)
+        ahead_idxs = np.where(dots >= cos_limit)[0]
+        weak_idxs  = np.where(dots >= 0.0)[0]
+
+        # Candidate pools intersect with far_mask to remove extremely far ones
+        ahead_idxs = np.array([i for i in ahead_idxs if far_mask[i]], dtype=int)
+        weak_idxs  = np.array([i for i in weak_idxs  if far_mask[i]], dtype=int)
+
+        # rebuild sets AFTER filtering
+        ahead_set = set(ahead_idxs.tolist())
+        weak_set  = set(weak_idxs.tolist())
+
+        other_idxs = np.array(
+            [i for i in range(len(F)) if far_mask[i] and i not in ahead_set and i not in weak_set],
+            dtype=int
+        )
+
+        # If everything is empty, no reachable frontiers remain
+        if ahead_idxs.size == 0 and weak_idxs.size == 0 and other_idxs.size == 0:
+            self.get_logger().warn("No valid frontier indices remain after filtering.")
+            return False
+
+        # choose ordering by score (descending)
+        if ahead_idxs.size > 0:
+            candidate_order = ahead_idxs[np.argsort(scores[ahead_idxs])[::-1]]
+        elif weak_idxs.size > 0:
+            candidate_order = weak_idxs[np.argsort(scores[weak_idxs])[::-1]]
+        else:
+            candidate_order = other_idxs[np.argsort(scores[other_idxs])[::-1]]
+
+        # Try each candidate in ranked order
+        for idx in candidate_order:
+            fx, fy = int(F[idx, 0]), int(F[idx, 1])
+            frontier = (fx, fy)
+
+            # FIND SAFE TARGET
+            safe_target = self.find_safe_target_near_frontier(fx, fy)
+            if safe_target is None:
+                # mark failure
+                self.failed_frontiers[frontier] = self.failed_frontiers.get(frontier, 0) + 1
+                self._failed_timestamps[frontier] = now
                 continue
 
-            gx, gy = safe
+            # Now run A*
+            start = (rx, ry)
+            goal = safe_target
+            path = self.astar_grid(start, goal)
 
-            # --- PATCH: skip trivial goals (too close to robot) ---
-            if abs(gx - rx) + abs(gy - ry) < 3:
-                # skip this frontier; pick a deeper target instead
-                continue
-            # ------------------------------------------------------
-
-            # 5. Run A* to the safe target
-            path = self.astar_grid((rx, ry), (gx, gy))
             if path:
+                # success
                 self.current_path = path
+                # convert to world coords
                 self.current_path_world = [self.grid_to_world(x, y) for x, y in path]
-                self.path_goal = (cx, cy)
-                self.get_logger().info(
-                    f"Planned path to frontier centroid {(cx, cy)} "
-                    f"(len={len(path)}, score={score:.3f})"
-                )
+                # smooth path for better following (use small window)
+                self.current_path_world = self.smooth_path(self.current_path_world, window=1)
+
+                # store frontier (not safe target)
+                self.path_goal = frontier
+
+                # reset progress tracking
+                self.last_progress_dist = None
+                self.last_progress_time = now
+                self.last_progress_path_seq = self.map_seq
+
+                self.get_logger().info(f"📍 Path to frontier={frontier} via safe={safe_target}, len={len(path)}")
+                # reset path following index
+                self.last_path_idx = 0
                 return True
 
-            # A* failed → mark as failed
-            self.failed_frontiers[(cx, cy)] += 1
-            self.failed_timestamps[(cx, cy)] = time.time()
+            # A* failed → mark this frontier failed
+            self.failed_frontiers[frontier] = self.failed_frontiers.get(frontier, 0) + 1
+            self._failed_timestamps[frontier] = now
+
+        # Fallback: try all by distance
+        order2 = np.argsort(dist)
+        for idx in order2:
+            fx, fy = int(F[idx, 0]), int(F[idx, 1])
+            frontier = (fx, fy)
+
+            safe_target = self.find_safe_target_near_frontier(fx, fy)
+            if safe_target is None:
+                continue
+
+            path = self.astar_grid((rx, ry), safe_target)
+            if not path:
+                continue
+
+            self.current_path = path
+            self.current_path_world = [self.grid_to_world(x, y) for x, y in path]
+            self.current_path_world = self.smooth_path(self.current_path_world, window=3)
+            self.path_goal = frontier
+            self.last_progress_dist = None
+            self.last_progress_time = now
+            self.last_progress_path_seq = self.map_seq
+
+            self.get_logger().info(f"📍 Fallback path to frontier={frontier} safe={safe_target}")
+            self.last_path_idx = 0
+            return True
 
         return False
 
-    # ------------------------ SAFE TARGET NEAR FRONTIER ------------------------
-    def find_safe_target_near_frontier(self, fx: int, fy: int, max_radius: int = 8) -> Optional[Tuple[int,int]]:
+
+    def find_safe_target_near_frontier(self, fx, fy, max_radius=12):
         """
-        Search inflated_map near (fx, fy) for a free cell to use as A* goal.
-        Prefer a cell slightly back from the frontier towards the robot (so robot doesn't drive into unknown).
+        Search the inflated map around the frontier (fx, fy)
+        for the nearest safe navigable cell.
+        This prevents the robot from trying to drive into narrow or unsafe spots.
+        Preference is given to candidates with larger clearance (but ties break to closeness).
         """
+
         if self.inflated_map is None:
             return None
-        H, W = self.inflated_map.shape
-        # direction back toward robot
-        rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
-        vx, vy = rx - fx, ry - fy
-        norm = math.hypot(vx, vy) or 1.0
-        cand_x = int(round(fx + (vx / norm) * MIN_GOAL_DIST))
-        cand_y = int(round(fy + (vy / norm) * MIN_GOAL_DIST))
-        # check candidate then spiral   
-        def is_free(x, y):
-            if 0 <= x < W and 0 <= y < H:
-                return self.inflated_map[y, x] == 0
-            return False
 
-        if is_free(cand_x, cand_y):
-            return (cand_x, cand_y)
+        H, W = self.map_height, self.map_width
+
+        # collect candidates in spiral out to max_radius
+        candidates = []
+        if self.is_cell_free_inflated(fx, fy):
+            candidates.append((fx, fy))
 
         for r in range(1, max_radius + 1):
             for dx in range(-r, r + 1):
                 for dy in (-r, r):
                     x, y = fx + dx, fy + dy
-                    if is_free(x, y):
-                        return (x, y)
+                    if 0 <= x < W and 0 <= y < H and self.is_cell_free_inflated(x, y):
+                        candidates.append((x, y))
             for dy in range(-r + 1, r):
                 for dx in (-r, r):
                     x, y = fx + dx, fy + dy
-                    if is_free(x, y):
-                        return (x, y)
-        return None
+                    if 0 <= x < W and 0 <= y < H and self.is_cell_free_inflated(x, y):
+                        candidates.append((x, y))
 
-    # ------------------------ A* (4-connected) ------------------------
-    def astar_grid(self, start: Tuple[int,int], goal: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
-        if self.inflated_map is None:
-            return None
-        sx, sy = int(start[0]), int(start[1])
-        gx, gy = int(goal[0]), int(goal[1])
-        H, W = self.inflated_map.shape
-        if not (0 <= sx < W and 0 <= sy < H and 0 <= gx < W and 0 <= gy < H):
-            return None
-        if self.inflated_map[sy, sx] == 1 or self.inflated_map[gy, gx] == 1:
+        if not candidates:
             return None
 
+        # clearance function (small window)
+        def clearance_at(cx, cy, search_r=6):
+            x0 = max(0, cx - search_r); x1 = min(W, cx + search_r + 1)
+            y0 = max(0, cy - search_r); y1 = min(H, cy + search_r + 1)
+            sub = self.inflated_map[y0:y1, x0:x1]
+            ys, xs = np.where(sub == 1)
+            if len(xs) == 0:
+                return float(search_r + 1)
+            ys_global = ys + y0
+            xs_global = xs + x0
+            dxs = xs_global - cx
+            dys = ys_global - cy
+            dists = np.hypot(dxs, dys)
+            return float(np.min(dists))
+
+        # choose candidate using clearance then closeness
+        best = None
+        best_clr = -1.0
+        best_dist = 1e9
+        for c in candidates:
+            c_clr = clearance_at(c[0], c[1], search_r=10)
+            d_to_front = math.hypot(c[0]-fx, c[1]-fy)
+            # choose if significantly better clearance
+            if c_clr > best_clr + 0.2:
+                best_clr = c_clr
+                best_dist = d_to_front
+                best = c
+            elif abs(c_clr - best_clr) <= 0.2:
+                if d_to_front < best_dist:
+                    best_dist = d_to_front
+                    best = c
+
+        return best
+
+    # -----------------------------------------------------
+    #               A* ON GRID (4-connected)
+    # -----------------------------------------------------
+    def astar_grid(self, start, goal):
+        sx, sy = start
+        gx, gy = goal
+        H, W = self.map_height, self.map_width
+        M = self.inflated_map
+
+        # bounds
+        if not (0 <= sx < W and 0 <= sy < H): return None
+        if not (0 <= gx < W and 0 <= gy < H): return None
+        if M[sy, sx] == 1: return None
+        if M[gy, gx] == 1: return None
+
+        # priority queue holds (f, g, (x,y))
         open_heap = []
-        heapq.heappush(open_heap, (0 + self.heuristic((sx,sy),(gx,gy)), 0, (sx,sy), None))
+        heapq.heappush(open_heap, (self.heuristic(start, goal), 0, start))
         came_from = {}
-        gscore = { (sx,sy): 0 }
+        gscore = {start: 0}
         closed = set()
-        neighbors = [(1,0),(-1,0),(0,1),(0,-1)]
+
+        # clearance threshold
+        min_c = self.robot_radius_cells if self.robot_radius_cells is not None else 1
+
+        # 8-neighbors (dx,dy,cost)
+        neighbors = [
+            (1, 0, 1), (-1, 0, 1), (0, 1, 1), (0, -1, 1),
+            (1, 1, math.sqrt(2)), (1, -1, math.sqrt(2)),
+            (-1, 1, math.sqrt(2)), (-1, -1, math.sqrt(2))
+        ]
 
         while open_heap:
-            f, g, current, parent = heapq.heappop(open_heap)
-            if current in closed:
+            f, g, (cx, cy) = heapq.heappop(open_heap)
+
+            if (cx, cy) in closed:
                 continue
-            came_from[current] = parent
-            if current == (gx, gy):
-                # reconstruct
+            closed.add((cx, cy))
+
+            # reached goal
+            if (cx, cy) == goal:
                 path = []
-                node = current
+                node = (cx, cy)
                 while node is not None:
                     path.append(node)
-                    node = came_from[node]
+                    node = came_from.get(node)
                 path.reverse()
                 return path
-            closed.add(current)
-            cx, cy = current
-            for dx, dy in neighbors:
+
+            # explore neighbors
+            for dx, dy, cost in neighbors:
                 nx, ny = cx + dx, cy + dy
+
                 if not (0 <= nx < W and 0 <= ny < H):
                     continue
-                if self.inflated_map[ny, nx] == 1:
+
+                # require clearance at target cell
+                if self.clearance_map is None or self.clearance_map[ny, nx] < min_c:
                     continue
-                neighbor = (nx, ny)
-                tentative_g = g + 1
-                if tentative_g < gscore.get(neighbor, 1e9):
-                    gscore[neighbor] = tentative_g
-                    fscore = tentative_g + self.heuristic(neighbor, (gx, gy))
-                    heapq.heappush(open_heap, (fscore, tentative_g, neighbor, current))
+
+                # diagonal requires both orthogonal neighbors free enough
+                if dx != 0 and dy != 0:
+                    if (self.clearance_map[cy, cx + dx] < min_c or
+                        self.clearance_map[cy + dy, cx] < min_c):
+                        continue
+
+                ng = g + cost
+                if ng < gscore.get((nx, ny), float('inf')):
+                    gscore[(nx, ny)] = ng
+                    fscore = ng + self.heuristic((nx, ny), goal)
+                    came_from[(nx, ny)] = (cx, cy)
+                    heapq.heappush(open_heap, (fscore, ng, (nx, ny)))
+
         return None
 
-    def heuristic(self, a: Tuple[int,int], b: Tuple[int,int]) -> float:
-        return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    # ------------------------ WORLD/GRID helpers ------------------------
-    def world_to_grid(self, wx: float, wy: float) -> Tuple[int,int]:
-        gx = int((wx - self.map_origin[0]) / self.map_res)
-        gy = int((wy - self.map_origin[1]) / self.map_res)
-        gx = max(0, min(self.map_width - 1, gx))
-        gy = max(0, min(self.map_height - 1, gy))
-        return gx, gy
 
-    def grid_to_world(self, gx: int, gy: int) -> Tuple[float,float]:
-        wx = self.map_origin[0] + gx * self.map_res + 0.5*self.map_res
-        wy = self.map_origin[1] + gy * self.map_res + 0.5*self.map_res
-        return wx, wy
+    def heuristic(self, a, b):
+        # Euclidean distance in grid cells
+        return math.hypot(a[0]-b[0], a[1]-b[1])
 
-    # ------------------------ PURE PURSUIT local controller ------------------------
-    def pure_pursuit_control(self) -> Twist:
+    # -----------------------------------------------------
+    #                PATH SMOOTHING / FOLLOWING
+    # -----------------------------------------------------
+    def smooth_path(self, world_path, window=3):
         """
-        Lookahead-based control: find first point on path beyond LOOKAHEAD_M, compute curvature
-        and convert curvature to v, omega. Smooth and clamp velocities.
+        world_path: list of (x, y) tuples in world coords
+        returns a new list of (x,y) smoothed by sliding-average
         """
-        if not self.current_path_world:
-            return Twist()
+        if not world_path:
+            return []
 
-        # find lookahead point
-        lx = None; ly = None
-        for (wx, wy) in self.current_path_world:
-            dx = wx - self.robot_x; dy = wy - self.robot_y
-            d = math.hypot(dx, dy)
-            if d >= LOOKAHEAD_M:
-                lx, ly = wx, wy
-                break
-        if lx is None:
-            # no lookahead found -> use last waypoint
-            lx, ly = self.current_path_world[-1]
+        n = len(world_path)
+        smoothed = []
+        for i in range(n):
+            x_sum = 0.0
+            y_sum = 0.0
+            count = 0
+            for j in range(max(0, i-window), min(n, i+window+1)):
+                x_sum += world_path[j][0]
+                y_sum += world_path[j][1]
+                count += 1
+            smoothed.append((x_sum / count, y_sum / count))
+        return smoothed
 
-        # transform to robot frame
-        dx = lx - self.robot_x; dy = ly - self.robot_y
-        # rotate by -robot_yaw
-        x_r = math.cos(-self.robot_yaw) * dx - math.sin(-self.robot_yaw) * dy
-        y_r = math.sin(-self.robot_yaw) * dx + math.cos(-self.robot_yaw) * dy
+    def get_path_idx(self, path_world, last_idx=0):
+        """
+        Return next path index based on lookahead distance.
+        path_world: list of (x,y)
+        """
+        if not path_world:
+            return 0
+        vx = self.robot_x
+        vy = self.robot_y
+        lookahead = 0.3  # meters
+        n = len(path_world)
+        for i in range(last_idx, n):
+            px, py = path_world[i]
+            dist = math.hypot(px - vx, py - vy)
+            if dist > lookahead:
+                return i
+        return n - 1
 
-        # curvature kappa = 2*y_r / L^2 where L is lookahead distance
-        L = math.hypot(x_r, y_r)
-        if L < 1e-6:
-            return Twist()
+    def quat_to_yaw(self, q):
+        """Convert quaternion to yaw (safe for ROS standard axes)."""
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y**2 + q.z**2)
+        return math.atan2(siny_cosp, cosy_cosp)
 
-        kappa = (2.0 * y_r) / (L * L)
-        # target linear speed scaled by how much curvature required
-        v = MAX_LINEAR_SPEED * max(0.15, (1.0 - min(abs(kappa)*2.5, 0.9)))
-        # if close to final waypoint, slow
-        # if final waypoint near, pop it
-        # also if path point within GOAL_NEAR_DIST_M, pop it
-        wx0, wy0 = self.current_path_world[0]
-        if math.hypot(wx0 - self.robot_x, wy0 - self.robot_y) < GOAL_NEAR_DIST_M:
-            # pop first waypoint
-            self.current_path_world.pop(0)
-            if self.current_path:
-                self.current_path.pop(0)
-            # if path finished, mark visited area and request plan
-            if not self.current_path_world:
-                self._mark_frontier_visited()
-                self.current_path = []
-                self.path_goal = None
-                return Twist()
+    def path_follower_from_xy(self, goal_x, goal_y):
+        """
+        Simple PID-like path follower adapted from Navigation.path_follower.
+        Returns (speed, heading, dist_to_goal)
+        """
+        vx = self.robot_x
+        vy = self.robot_y
+        gx = goal_x
+        gy = goal_y
 
-        # compute omega = v * kappa (approx)
-        omega = v * kappa
-        # clamp
-        v = max(0.0, min(MAX_LINEAR_SPEED, v))
-        omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, omega))
+        yaw = self.robot_yaw
 
+        desired_yaw = math.atan2(gy - vy, gx - vx)
+
+        # Compute heading error safely
+        heading_error = (desired_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
+
+        # distance to goal
+        dist = math.hypot(gx - vx, gy - vy)
+
+        # PID-like control (tuned)
+        Kp_ang = 1.2   # proportional gain for heading
+        Kd_ang = 0.15  # derivative gain (unused here, but available)
+        Kp_lin = 0.7   # linear scaling
+
+        # heading control
+        heading = Kp_ang * heading_error
+        # clamp angular
+        heading = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, heading))
+
+        # reduce speed when heading error is large
+        cos_term = math.cos(heading_error)
+        # ensure non-negative
+        if cos_term < 0:
+            cos_term = 0.0
+        speed = max(0.03, min(MAX_LINEAR_SPEED, Kp_lin * dist * cos_term))
+
+        # If obstacle close in front, slow more
+        if hasattr(self, "front") and self.front < 0.35:
+            speed = min(speed, 0.06)
+
+        return speed, heading, dist
+
+    def move_ttbot(self, speed, heading):
+        """Publish Twist using speed and heading (heading here is angular.z command)."""
         cmd = Twist()
-        cmd.linear.x = v
-        cmd.angular.z = omega
-        return cmd
+        cmd.linear.x = speed
+        cmd.angular.z = heading
+        self.cmd_pub.publish(cmd)
 
-    # ------------------------ REACTIVE VECTOR FIELD ------------------------
-    def reactive_vector_override(self) -> Optional[Twist]:
-        """
-        Compute repulsive vector from lidar points in front half-plane and combine
-        with attractive vector toward current lookahead point (if any).
-        If combined forward component <= 0 -> return rotate-only cmd.
-        Return None if no reactive action necessary (no near obstacles).
-        """
-        if self.ranges_full is None:
-            return None
-        # quick checks using precomputed front/left/right
-        if self.front < STOP_DIST:
-            # immediate rotate away
-            cmd = Twist(); cmd.linear.x = 0.0
-            cmd.angular.z = 0.8 if self.left > self.right else -0.8
-            return cmd
-        if self.front > SLOW_DIST:
-            return None  # no avoidance needed
+    def move_ttbot_safe(self, speed, heading):
+        """Publish Twist but clamp to safe ranges."""
+        cmd = Twist()
+        cmd.linear.x = max(0.0, min(speed, MAX_LINEAR_SPEED))
+        cmd.angular.z = max(-MAX_ANGULAR_SPEED, min(heading, MAX_ANGULAR_SPEED))
+        self.cmd_pub.publish(cmd)
 
-        # Build repulsive vector in robot frame by sampling rays in frontal wedge +-60°
-        N = self.scan_n
-        if N == 0 or self.scan_angle_inc == 0:
-            return None
-        half_w = math.radians(60)
-        angs = np.arange(self.scan_angle_min, self.scan_angle_min + N*self.scan_angle_inc, self.scan_angle_inc)
-        # choose angles in [-60, +60]
-        indices = np.where(np.logical_and(angs >= -half_w, angs <= half_w))[0]
-        if indices.size == 0:
-            # fallback to using left/right
-            ang = 0.6 if self.left > self.right else -0.6
-            cmd = Twist(); cmd.linear.x = AVOID_SPEED; cmd.angular.z = ang
-            return cmd
+    def stop_robot(self):
+        cmd = Twist()
+        cmd.linear.x = 0.0
+        cmd.angular.z = 0.0
+        self.cmd_pub.publish(cmd)
 
-        # repulsion sum
-        rx = 0.0; ry = 0.0
-        for i in indices:
-            r = float(self.ranges_full[i])
-            if r <= 0.001 or r > SLOW_DIST:
-                continue
-            a = angs[i]
-            # weight inverse-square, clamp
-            w = 1.0 / max(0.01, r*r)
-            rx += -w * math.cos(a)
-            ry += -w * math.sin(a)
 
-        # attractive vector = heading toward lookahead (robot frame)
-        attr_x = 0.0; attr_y = 0.0
-        if self.current_path_world:
-            # take first point as attraction
-            lx, ly = self.current_path_world[0]
-            dx = lx - self.robot_x; dy = ly - self.robot_y
-            # robot-frame transform
-            attr_x = math.cos(-self.robot_yaw) * dx - math.sin(-self.robot_yaw) * dy
-            attr_y = math.sin(-self.robot_yaw) * dx + math.cos(-self.robot_yaw) * dy
-
-        # combine repulsion + attraction (weights)
-        vx = 0.8 * attr_x + 1.5 * rx
-        vy = 0.8 * attr_y + 1.5 * ry
-
-        # compute desired heading and forward
-        desired_angle = math.atan2(vy, vx) if abs(vx) > 1e-6 or abs(vy) > 1e-6 else 0.0
-        forward = vx * math.cos(desired_angle) + vy * math.sin(desired_angle)
-        # clamp forward to small positive speed while avoiding
-        if forward <= 0.0:
-            # no forward component -> spin in place toward more free side
-            cmd = Twist(); cmd.linear.x = 0.0
-            cmd.angular.z = 0.6 if self.left > self.right else -0.6
-            return cmd
-        else:
-            cmd = Twist()
-            cmd.linear.x = min(AVOID_SPEED, forward)
-            cmd.angular.z = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, desired_angle * 1.0))
-            return cmd
-
-    # ------------------------ HARD SAFETY OVERRIDE ------------------------
-    def hard_safety_override(self) -> Optional[Twist]:
-        """
-        Top-level hard safety: if ANY ray in a narrow frontal wedge closer than STOP_DIST,
-        immediately stop forward motion and rotate away.
-        """
-        if self.ranges_full is None or self.scan_n == 0:
-            return None
-        # take central wedge ±20% of scan (approx ±72° on 360 -> but uses angles)
-        N = self.scan_n
-        if N == 0:
-            return None
-        # compute front arc indices around forward angle (angle 0 corresponds to self.scan_angle_min -> need mapping)
-        # faster heuristic: use self.front computed earlier (median/min style)
-        if self.front < STOP_DIST:
-            cmd = Twist(); cmd.linear.x = 0.0
-            cmd.angular.z = 0.8 if self.left > self.right else -0.8
-            return cmd
-        return None
-
-    # ------------------------ STUCK DETECTION & RECOVERY ------------------------
-    def _check_stuck(self, now: float) -> bool:
-        if not self.odom_received:
-            return False
-        if not hasattr(self, "last_cmd") or getattr(self.last_cmd, "linear", None) is None:
-            return False
-        if self.last_cmd.linear.x <= 0.03:
-            # not actively moving forward, don't consider stuck
-            if self.last_pos is None:
-                self.last_pos = (self.robot_x, self.robot_y)
-                self.last_movement_time = now
-            return False
-
-        if self.last_pos is None:
-            self.last_pos = (self.robot_x, self.robot_y)
-            self.last_movement_time = now
-            return False
-
-        dx = self.robot_x - self.last_pos[0]; dy = self.robot_y - self.last_pos[1]
-        moved = math.hypot(dx, dy)
-        if moved > STUCK_MOVE_THRESH:
-            self.last_pos = (self.robot_x, self.robot_y); self.last_movement_time = now
-            return False
-
-        if now - self.last_movement_time > STUCK_TIME:
-            self.get_logger().warn("Stuck detected — starting recovery")
-            self.start_recovery()
-            return True
-        return False
-
+    # -----------------------------------------------------
+    #                RECOVERY BEHAVIOR
+    # -----------------------------------------------------
     def start_recovery(self):
-        # if boxed in both front & rear -> clear path & replan
-        front_blocked = self.front < STOP_DIST if hasattr(self, "front") else False
-        rear_blocked = (self.left < REAR_BLOCK_DIST or self.right < REAR_BLOCK_DIST) if hasattr(self, "left") else False
-        if front_blocked and rear_blocked:
-            self.get_logger().warn("Boxed in — clearing path & replanning")
-            self._reset_path()
-            self.recovering = False
-            return
-        # start backup then rotate
+        # start backup stage first then rotate
         self.recovering = True
         self.recovery_stage = "backup"
         self.recovery_end_time = time.time() + BACKUP_TIME
 
-    def recovery_cmd(self) -> Twist:
+    def recovery_cmd(self):
         cmd = Twist()
-        if not getattr(self, "recovering", False):
-            return cmd
-        # check rear safety
-        rear_blocked = (self.left < REAR_BLOCK_DIST or self.right < REAR_BLOCK_DIST)
-        if self.recovery_stage == "backup" and rear_blocked:
-            # skip backup -> rotate
-            self.recovery_stage = "rotate"
-            self.recovery_end_time = time.time() + RECOVERY_ROTATE_TIME
         if self.recovery_stage == "backup":
-            cmd.linear.x = -0.04; cmd.angular.z = 0.0
+            # back up slowly
+            cmd.linear.x = -0.06
+            cmd.angular.z = 0.0
+            # if time passed, move to rotate
             if time.time() >= self.recovery_end_time:
-                self.recovery_stage = "rotate"; self.recovery_end_time = time.time() + RECOVERY_ROTATE_TIME
+                self.recovery_stage = "rotate"
+                self.recovery_end_time = time.time() + RECOVERY_ROTATE_TIME
+                return cmd
             return cmd
-        if self.recovery_stage == "rotate":
-            # if rotate unsafe, give up and clear path
-            if (self.left < 0.12 and self.right < 0.12):
-                self.get_logger().warn("Rotate unsafe — clearing path")
-                self._reset_path()
-                self.recovering = False
-                return Twist()
-            cmd.linear.x = 0.0; cmd.angular.z = 0.6
-            # finish recovery after rotate time passes
-            if time.time() >= self.recovery_end_time:
-                self.recovering = False
+        elif self.recovery_stage == "rotate":
+            # rotate in place
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.6
             return cmd
-        return cmd
-
-    # ------------------------ VISITED / FRONTIER MARKING ------------------------
-    def _mark_frontier_visited(self):
-        """
-        When the robot reaches the end of a path, mark frontier area visited by checking
-        whether unknown cells behind frontier became observed. We conservatively mark a disk
-        in visited_mask around the centroid, but only if unknowns were resolved.
-        """
-        if self.path_goal is None or self.visited_mask is None or self.map_data is None:
-            return
-        cx, cy = self.path_goal
-        # check whether near-frontier unknown cells are now known (not UNKNOWN_VAL)
-        M = self.map_data
-        H, W = M.shape
-        rr = max(2, int(0.5 / self.map_res))
-        x0 = max(0, cx - rr); x1 = min(W, cx + rr + 1)
-        y0 = max(0, cy - rr); y1 = min(H, cy + rr + 1)
-        region = M[y0:y1, x0:x1]
-        # if region has no unknowns -> mark visited
-        if np.all(region != UNKNOWN_VAL):
-            xs = np.arange(x0, x1); ys = np.arange(y0, y1)
-            dxs = xs.reshape(1, -1) - cx; dys = ys.reshape(-1, 1) - cy
-            d2 = dxs*dxs + dys*dys
-            disk = d2 <= (rr*rr)
-            self.visited_mask[y0:y1, x0:x1] |= disk
-            self.get_logger().info(f"Marked frontier at {(cx,cy)} visited (radius {rr}).")
         else:
-            # don't mark visited if unknown remains — ensures not prematurely declaring done
-            self.get_logger().info(f"Frontier at {(cx,cy)} not yet observed behind; not marking visited.")
+            return Twist()
 
-    # ------------------------ HELPERS ------------------------
-    def _any_reachable_unknown(self) -> bool:
-        """
-        Check whether any unknown cells are reachable from the robot's free workspace.
-        If none -> exploration is done.
-        """
-        if self.map_data is None or self.inflated_map is None:
-            return False
-        reachable = self._reachable_mask()
-        if reachable is None:
-            return False
-        unknown = (self.map_data == UNKNOWN_VAL)
-        # reachable unknown if any unknown cell has a free neighbor that is reachable
-        H, W = self.map_data.shape
-        for y in range(1, H-1):
-            for x in range(1, W-1):
-                if not unknown[y, x]:
-                    continue
-                # if any neighbor free & reachable
-                neigh = [(x+1,y),(x-1,y),(x,y+1),(x,y-1)]
-                for nx, ny in neigh:
-                    if 0 <= nx < W and 0 <= ny < H and reachable[ny, nx] and self.inflated_map[ny, nx] == 0:
-                        return True
-        return False
 
-    def _reset_path(self):
-        self.current_path = []; self.current_path_world = []; self.path_goal = None
+    # -----------------------------------------------------
+    #             MAP <-> WORLD helpers
+    # -----------------------------------------------------
+    def world_to_grid(self, wx, wy):
+        gx = int((wx - self.map_origin[0]) / self.map_res)
+        gy = int((wy - self.map_origin[1]) / self.map_res)
+        # clamp
+        gx = max(0, min(self.map_width - 1, gx))
+        gy = max(0, min(self.map_height - 1, gy))
+        return gx, gy
 
-    def _publish_stop(self):
-        cmd = Twist(); cmd.linear.x = 0.0; cmd.angular.z = 0.0
-        self.cmd_pub.publish(cmd)
-        self.last_cmd = cmd
+    def grid_to_world(self, gx, gy):
+        wx = self.map_origin[0] + gx * self.map_res + 0.5*self.map_res
+        wy = self.map_origin[1] + gy * self.map_res + 0.5*self.map_res
+        return wx, wy
 
-# ----------------------------- main ---------------------------------
 def main(args=None):
     rclpy.init(args=args)
-    node = Explorer()
+    node = Task1()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -945,5 +980,5 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

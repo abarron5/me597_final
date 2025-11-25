@@ -34,7 +34,7 @@ MIN_FRONTIER_GRID_DIST = 6    # minimum grid cells away from robot to accept fro
 class Task1(Node):
 
     def __init__(self):
-        super().__init__('task1_node')
+        super().__init__('task1_algorithm')
 
         # Subscribers
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
