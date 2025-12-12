@@ -12,15 +12,19 @@ import time
 import heapq
 from collections import deque
 
+import os
+from PIL import Image
+import yaml
+
 
 # ---------- TUNABLE PARAMETERS ----------
-OCCUPIED_THRESH = 50          # occupancy grid value >= this is considered an obstacle
+OCCUPIED_THRESH = 30          # occupancy grid value >= this is considered an obstacle
 UNKNOWN_VAL = -1
-INFLATE_RADIUS = 4.2            # smaller by default; adjust if robot footprint requires
+INFLATE_RADIUS = 5            # smaller by default; adjust if robot footprint requires
 GOAL_NEAR_DIST_M = 0.15       # when within this world distance to goal waypoint, pop waypoint
-ALIGN_ANGLE = 0.20            # radians: how close to aligned before driving forward
-MAX_LINEAR_SPEED = 0.4
-MAX_ANGULAR_SPEED = 0.6
+ALIGN_ANGLE = 0.15            # radians: how close to aligned before driving forward
+MAX_LINEAR_SPEED = 0.6
+MAX_ANGULAR_SPEED = 0.8
 OBSTACLE_FRONT_THRESH = 0.40  # meters
 REPLAN_INTERVAL = 1.0         # seconds between forced replans
 STUCK_TIME = 4.0              # seconds to consider stuck
@@ -99,8 +103,8 @@ class Task1(Node):
         self.visited_mask = None           # numpy bool array same shape as map
         self.VISITED_RADIUS = 10            # radius in grid cells to mark visited around goals (tune)
         self.failed_frontiers = {}         # dict {(gx,gy): fail_count}
-        self.FAILED_LIMIT = 3              # after this many A* fails, temporarily ignore frontier
-        self.FAILED_CLEAR_TIME = 15.0      # seconds after which failed_frontiers entry may be dropped
+        self.FAILED_LIMIT = 5              # after this many A* fails, temporarily ignore frontier
+        self.FAILED_CLEAR_TIME = 1.0      # seconds after which failed_frontiers entry may be dropped
         self._failed_timestamps = {}       # {(gx,gy): last_fail_time}
 
         # path-following helper
@@ -126,12 +130,12 @@ class Task1(Node):
             return
 
         # ---------------- STUCK CHECK ----------------
-        if self._check_stuck(now):
-            return
+        """if self._check_stuck(now):
+            return"""
 
         # ---------------- FOLLOW CURRENT PATH ----------------
         if self.current_path and self.current_path_world:
-            # Use the improved follower from the Navigation lab
+            # Get path index
             idx = self.get_path_idx(self.current_path_world, self.last_path_idx)
             idx = max(0, min(idx, len(self.current_path_world)-1))
             current_goal = self.current_path_world[idx]
@@ -175,6 +179,7 @@ class Task1(Node):
 
         # ---------------- PLAN NEW PATH ----------------
         if now - self.last_plan_time > REPLAN_INTERVAL or not self.current_path:
+            #self.get_logger().info(f"{self.plan_to_frontier(farthest=False)}")
             if not self.plan_to_frontier(farthest=False):
                 self.get_logger().info("🎉 Map complete (or no reachable frontiers). Stopping.")
                 self.cmd_pub.publish(Twist())
@@ -254,44 +259,6 @@ class Task1(Node):
         self.last_path_idx = 0
 
     # ---------------- LIDAR ----------------
-    def scan_callback_old(self, msg):
-        ranges = np.array(msg.ranges)
-        ranges = np.where(np.isfinite(ranges), ranges, 10.0)
-        self.ranges_full = ranges
-        N = len(ranges)
-        # front: central ±10-12% (robust to different lidar indexing)
-        i0 = int(N * 0.44); i1 = int(N * 0.56)
-        sector = ranges[i0:i1]
-        self.front = float(np.percentile(sector, 5))  # ignores single outliers
-        """if i0 <= i1:
-            self.front = float(np.min(ranges[i0:i1]))
-        else:
-            self.front = float(min(np.min(ranges[i0:]), np.min(ranges[:i1])))"""
-        # left/right sectors (20%-35% and 65%-80%)
-        self.left = float(np.min(ranges[int(N*0.20):int(N*0.35)]))
-        self.right = float(np.min(ranges[int(N*0.65):int(N*0.80)]))
-    
-    # ---------------- LIDAR ----------------
-    def scan_callback_old2(self, msg):
-        ranges = np.array(msg.ranges, dtype=float)
-        ranges = np.where(np.isfinite(ranges), ranges, 10.0)
-        self.ranges_full = ranges
-        N = len(ranges)
-
-        # FRONT sector: central 12% (good for TB3)
-        i0 = int(0.44 * N)
-        i1 = int(0.56 * N)
-        front_sector = ranges[i0:i1]
-        # ignore outliers → more stable
-        self.front = float(np.percentile(front_sector, 5))
-
-        # SIDE sectors (use percentiles for stability)
-        left_sec  = ranges[int(0.20*N):int(0.35*N)]
-        right_sec = ranges[int(0.65*N):int(0.80*N)]
-
-        self.left  = float(np.percentile(left_sec,  10))
-        self.right = float(np.percentile(right_sec, 10))
-
     def scan_callback(self, msg):
         # Clean ranges
         ranges = np.array(msg.ranges, dtype=float)
@@ -333,7 +300,6 @@ class Task1(Node):
         self.right = median_in_sector(RIGHT)
 
 
-
     # ---------------- ODOM ----------------
     def odom_callback(self, msg):
         self.robot_x = msg.pose.pose.position.x
@@ -370,7 +336,6 @@ class Task1(Node):
                 w = min(W_old, W_new)
                 new_mask[:h, :w] = self.visited_mask[:h, :w]
                 self.visited_mask = new_mask
-
 
 
     # ---------------- INFLATION ----------------
@@ -426,7 +391,7 @@ class Task1(Node):
         for y in range(1, H-1):
             for x in range(1, W-1):
                 # treat 0..30 as free-ish for SLAM maps
-                if not (0 <= M[y, x] <= 30):
+                if not (0 <= M[y, x] <= OCCUPIED_THRESH):
                     continue
                 # check 8-neighborhood for unknown
                 neigh = M[y-1:y+2, x-1:x+2]
@@ -448,18 +413,55 @@ class Task1(Node):
     # -----------------------------------------------------
     #      PLANNING: choose reachable frontier -> A*
     # -----------------------------------------------------
+
+    def bfs_distances(self, start_gxgy):
+        """Returns grid-map shortest-path distances (in cells) from the robot 
+        to every reachable cell using BFS on the inflated map.
+        Non-reachable cells remain np.inf."""
+        
+        sx, sy = start_gxgy
+        H, W = self.map_height, self.map_width
+
+        dist = np.full((H, W), np.inf, dtype=float)
+        if not (0 <= sx < W and 0 <= sy < H):
+            return dist
+
+        if self.inflated_map[sy, sx] != 0:
+            return dist  # robot is in invalid cell (should not happen)
+
+        q = deque()
+        dist[sy, sx] = 0.0
+        q.append((sx, sy))
+
+        while q:
+            x, y = q.popleft()
+            d = dist[y, x] + 1.0  # grid cost per step
+
+            # 4-connected is safest for inflated maps
+            for nx, ny in ((x+1,y),(x-1,y),(x,y+1),(x,y-1)):
+                if 0 <= nx < W and 0 <= ny < H:
+                    if self.inflated_map[ny, nx] == 0 and d < dist[ny, nx]:
+                        dist[ny, nx] = d
+                        q.append((nx, ny))
+
+        return dist
+
+
     def plan_to_frontier(self, farthest=False):
+        # Map data
         M = self.map_data
         H, W = M.shape
         if self.map_data is None or self.inflated_map is None:
-            return False
-
+            return 0
+        
+        # Get frontiers
         frontiers = self.get_frontier_cells()
         self.get_logger().info(f"Frontiers found: {len(frontiers)}")
-        if not frontiers:
-            return False
         
-        # Filter visited & failed frontiers
+        if not frontiers:
+            return 0
+        
+        # Filter frontiers
         filtered_frontiers = []
         now = time.time()
 
@@ -467,29 +469,52 @@ class Task1(Node):
             # skip if visited
             if self.visited_mask is not None and self.visited_mask[fy, fx]:
                 continue
-
             # skip if failed too many times
             fail_count = self.failed_frontiers.get((fx, fy), 0)
-            if fail_count >= self.FAILED_LIMIT:
+            if len(frontiers) > 30 and fail_count >= self.FAILED_LIMIT:
                 # clear failed entry if stale
                 ts = self._failed_timestamps.get((fx, fy), 0)
                 if now - ts > self.FAILED_CLEAR_TIME:
                     self.failed_frontiers.pop((fx, fy), None)
                     self._failed_timestamps.pop((fx, fy), None)
                 else:
+                    self.get_logger().info("Failed frontier")
                     continue
 
             filtered_frontiers.append((fx, fy))
 
         if not filtered_frontiers:
-            return False
+            self.get_logger().info("No frontiers after filtering")
+            frontiers = self.option2(frontiers, now)
+            return frontiers
 
-        # Robot grid
+        # Find path distance to each frontier
         rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
+        if self.is_cell_free_inflated(rx, ry):
+            start = self.find_safe_target_near_frontier(rx, ry)
+            dist_map = self.bfs_distances(start)
+        else:
+            dist_map = self.bfs_distances((rx, ry))
+
         F = np.array(filtered_frontiers, dtype=float)
         dx = F[:, 0] - rx
         dy = F[:, 1] - ry
-        dist = np.hypot(dx, dy)
+        dist_euclid = np.hypot(dx, dy)
+
+        path_dists = np.array([dist_map[int(fy), int(fx)] for fx, fy in filtered_frontiers])
+
+        # Filter unreachable frontiers    
+        reachable_mask = np.isfinite(path_dists)
+        if not np.any(reachable_mask):
+            self.get_logger().warn("⚠ No reachable frontiers (path distance).")
+            frontiers = self.option2(frontiers, now)
+            return frontiers
+
+        F = F[reachable_mask]
+        dx = dx[reachable_mask]
+        dy = dy[reachable_mask]
+        dist_euclid = dist_euclid[reachable_mask]
+        path_dists = path_dists[reachable_mask]
 
         # Direction preference
         if self.exploration_dir is None:
@@ -498,8 +523,8 @@ class Task1(Node):
             ex, ey = self.exploration_dir
 
         with np.errstate(divide='ignore', invalid='ignore'):
-            ux = np.where(dist > 0, dx / dist, 0.0)
-            uy = np.where(dist > 0, dy / dist, 0.0)
+            ux = np.where(dist_euclid > 0, dx / dist_euclid, 0.0)
+            uy = np.where(dist_euclid > 0, dy / dist_euclid, 0.0)
 
         dots = ux * ex + uy * ey  # directional alignment score
 
@@ -507,54 +532,20 @@ class Task1(Node):
         # NEW SCORING: prefer aligned & nearer frontiers
         # -----------------------
         # parameters — tune if necessary
-        MAX_FRONTIER_DIST_M = 10.0     # ignore frontiers farther than this (meters)
+        MAX_FRONTIER_DIST_M = 20.0     # ignore frontiers farther than this (meters)
         LAMBDA_DIST = 0.6             # distance penalty weight [0..1]
 
-        # distance in meters
-        dist_m = dist * float(self.map_res)
+        # Use path distance instead of straight-line distance
+        dist_m = path_dists * float(self.map_res)
+
 
         # normalized distance [0..1]
         dist_norm = np.clip(dist_m / (MAX_FRONTIER_DIST_M + 1e-6), 0.0, 1.0)
 
         # score: favor alignment, penalize distance.
         # Range roughly in [-1 - lambda, 1]
-        scores = dots - LAMBDA_DIST * dist_norm
-
-        # Hard reject: drop frontiers that are extremely far (optional)
-        far_mask = dist_m <= MAX_FRONTIER_DIST_M
-
-        # Keep ahead/weak logic based on alignment (dots)
-        cos_limit = math.cos(self.EXPLORE_ANGLE_LIMIT)
-        ahead_idxs = np.where(dots >= cos_limit)[0]
-        weak_idxs  = np.where(dots >= 0.0)[0]
-
-        # Candidate pools intersect with far_mask to remove extremely far ones
-        ahead_idxs = np.array([i for i in ahead_idxs if far_mask[i]], dtype=int)
-        weak_idxs  = np.array([i for i in weak_idxs  if far_mask[i]], dtype=int)
-
-        # rebuild sets AFTER filtering
-        ahead_set = set(ahead_idxs.tolist())
-        weak_set  = set(weak_idxs.tolist())
-
-        other_idxs = np.array(
-            [i for i in range(len(F)) if far_mask[i] and i not in ahead_set and i not in weak_set],
-            dtype=int
-        )
-
-        # If everything is empty, no reachable frontiers remain
-        if ahead_idxs.size == 0 and weak_idxs.size == 0 and other_idxs.size == 0:
-            self.get_logger().warn("No valid frontier indices remain after filtering.")
-            return False
-
-        # choose ordering by score (descending)
-        if ahead_idxs.size > 0:
-            candidate_order = ahead_idxs[np.argsort(scores[ahead_idxs])[::-1]]
-        elif weak_idxs.size > 0:
-            candidate_order = weak_idxs[np.argsort(scores[weak_idxs])[::-1]]
-        else:
-            candidate_order = other_idxs[np.argsort(scores[other_idxs])[::-1]]
-
-            
+        scores = dots - LAMBDA_DIST * dist_norm        
+        candidate_order = np.argsort(scores)[::-1]
 
         # Try each candidate in ranked order
         for idx in candidate_order:
@@ -567,6 +558,7 @@ class Task1(Node):
                 # mark failure
                 self.failed_frontiers[frontier] = self.failed_frontiers.get(frontier, 0) + 1
                 self._failed_timestamps[frontier] = now
+                self.get_logger().info("Not safe target")
                 continue
 
             # Now run A*
@@ -593,42 +585,97 @@ class Task1(Node):
                 self.get_logger().info(f"📍 Path to frontier={frontier} via safe={safe_target}, len={len(path)}")
                 # reset path following index
                 self.last_path_idx = 0
-                return True
+                return frontiers
 
             # A* failed → mark this frontier failed
             self.failed_frontiers[frontier] = self.failed_frontiers.get(frontier, 0) + 1
             self._failed_timestamps[frontier] = now
+            #self.get_logger().info("No path")
 
-        # Fallback: try all by distance
-        order2 = np.argsort(dist)
-        for idx in order2:
-            fx, fy = int(F[idx, 0]), int(F[idx, 1])
-            frontier = (fx, fy)
+        self.get_logger().info("Reached end of planning")
+        return frontiers
+    
+    def option2(self, frontiers, now):
+        self.get_logger().info("📍 option 2")
 
-            safe_target = self.find_safe_target_near_frontier(fx, fy)
-            if safe_target is None:
-                continue
+        # ===========================================================
+        # CASE 1: OPEN AHEAD → MOVE FORWARD ~1.0 m
+        # ===========================================================
+        if self.front > 4.0:
+            self.get_logger().warn("➡️  No path, front > 4 m → forward exploration (~1 m).")
 
-            path = self.astar_grid((rx, ry), safe_target)
-            if not path:
-                continue
+            target_dist = 1.0   # meters forward
+            steps = 10
 
-            self.current_path = path
-            self.current_path_world = [self.grid_to_world(x, y) for x, y in path]
-            self.current_path_world = self.smooth_path(self.current_path_world, window=3)
-            self.path_goal = frontier
-            self.last_progress_dist = None
-            self.last_progress_time = now
-            self.last_progress_path_seq = self.map_seq
+            micro_path_world = []
+            micro_path_grid = []
 
-            self.get_logger().info(f"📍 Fallback path to frontier={frontier} safe={safe_target}")
+            for i in range(1, steps + 1):
+                p = i / steps
+                px = self.robot_x + p * target_dist * math.cos(self.robot_yaw)
+                py = self.robot_y + p * target_dist * math.sin(self.robot_yaw)
+
+                micro_path_world.append((px, py))
+
+                gx, gy = self.world_to_grid(px, py)
+                micro_path_grid.append((gx, gy))
+
+            self.current_path_world = micro_path_world
+            self.current_path = micro_path_grid
+            self.path_goal = None
             self.last_path_idx = 0
-            return True
+            self.last_plan_time = now
 
-        return False
+            self.get_logger().info("📍 Executing FORWARD micro-path.")
 
+        # ===========================================================
+        # CASE 2: BLOCKED AHEAD → BACK UP ~0.3 m
+        # ===========================================================
+        else:
+            self.get_logger().warn("⬅️  No path, front ≤ 4 m → backing up (~0.3 m).")
 
-    def find_safe_target_near_frontier(self, fx, fy, max_radius=6):
+            target_dist = -0.3   # NEGATIVE = move backward
+            steps = 10
+
+            micro_path_world = []
+            micro_path_grid = []
+
+            for i in range(1, steps + 1):
+                p = i / steps
+                px = self.robot_x + p * target_dist * math.cos(self.robot_yaw)
+                py = self.robot_y + p * target_dist * math.sin(self.robot_yaw)
+
+                micro_path_world.append((px, py))
+
+                gx, gy = self.world_to_grid(px, py)
+                micro_path_grid.append((gx, gy))
+
+            self.current_path_world = micro_path_world
+            self.current_path = micro_path_grid
+            self.path_goal = None
+            self.last_path_idx = 0
+            self.last_plan_time = now
+
+            self.get_logger().info("📍 Executing BACKWARD micro-path.")
+        return frontiers
+
+    def find_nearest_free(self, gx, gy, max_r=6):
+        for r in range(max_r+1):
+            for dx in range(-r, r+1):
+                for dy in (-r, r):
+                    x, y = gx+dx, gy+dy
+                    if 0 <= x < self.map_width and 0 <= y < self.map_height:
+                        if self.inflated_map[y][x] == 0:
+                            return (x, y)
+            for dy in range(-r+1, r):
+                for dx in (-r, r):
+                    x, y = gx+dx, gy+dy
+                    if 0 <= x < self.map_width and 0 <= y < self.map_height:
+                        if self.inflated_map[y][x] == 0:
+                            return (x, y)
+        return (gx, gy)
+
+    def find_safe_target_near_frontier(self, fx, fy, max_radius=25):
         """
         Search the inflated map around the frontier (fx, fy)
         for the nearest safe navigable cell.
@@ -659,6 +706,7 @@ class Task1(Node):
                         candidates.append((x, y))
 
         if not candidates:
+            self.get_logger().info(f"No canditates withing radius {max_radius}")
             return None
 
         # clearance function (small window)
@@ -684,7 +732,10 @@ class Task1(Node):
             c_clr = clearance_at(c[0], c[1], search_r=6)
             d_to_front = math.hypot(c[0]-fx, c[1]-fy)
             # choose if significantly better clearance
-            if c_clr > best_clr + 0.2:
+            #if c_clr > best_clr + 0.2:
+            # in narrow hallways, accept free cells as soon as they're free
+            if best is None or d_to_front < best_dist:
+
                 best_clr = c_clr
                 best_dist = d_to_front
                 best = c
@@ -832,7 +883,7 @@ class Task1(Node):
         # PID-like control (tuned)
         Kp_ang = 1.2   # proportional gain for heading
         Kd_ang = 0.15  # derivative gain (unused here, but available)
-        Kp_lin = 0.7   # linear scaling
+        Kp_lin = 1.0   # linear scaling
 
         # heading control
         heading = Kp_ang * heading_error
@@ -845,10 +896,20 @@ class Task1(Node):
         if cos_term < 0:
             cos_term = 0.0
         speed = max(0.03, min(MAX_LINEAR_SPEED, Kp_lin * dist * cos_term))
+        
+        #self.get_logger().info(f"Front dist: {self.front}")
+        
+        """# if LIDAR is blind, treat as danger
+        if hasattr(self, "front") and self.front > 10.0:
+            speed = MAX_LINEAR_SPEED
+            heading = 0.0
+            self.get_logger().warn("🛑 Emergency spin: front LIDAR returned max range!")"""
 
         # If obstacle close in front, slow more
-        if hasattr(self, "front") and self.front < 0.35:
-            speed = min(speed, 0.06)
+        if hasattr(self, "front") and self.front < 1.0:
+            speed = speed * self.front
+        elif hasattr(self, "front") and self.front < 0.5:
+            speed = min(speed * self.front, 0.06)
 
         return speed, heading, dist
 
@@ -918,6 +979,7 @@ class Task1(Node):
         wx = self.map_origin[0] + gx * self.map_res + 0.5*self.map_res
         wy = self.map_origin[1] + gy * self.map_res + 0.5*self.map_res
         return wx, wy
+
 
 def main(args=None):
     rclpy.init(args=args)

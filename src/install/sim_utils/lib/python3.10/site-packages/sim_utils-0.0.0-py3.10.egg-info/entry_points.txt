@@ -1,3 +1,0 @@
-[console_scripts]
-red_ball_controller = sim_utils.red_ball_control:main
-
