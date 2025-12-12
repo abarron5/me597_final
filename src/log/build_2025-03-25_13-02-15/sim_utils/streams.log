@@ -1,0 +1,21 @@
+[0.581s] Invoking command in '/home/justin/sim_ws/src/sim_utils': PYTHONPATH=/home/justin/sim_ws/src/build/sim_utils/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/justin/sim_ws/src/install/sim_utils/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../build/sim_utils build --build-base /home/justin/sim_ws/src/build/sim_utils/build install --record /home/justin/sim_ws/src/build/sim_utils/install.log --single-version-externally-managed install_data
+[0.790s] running egg_info
+[0.791s] writing ../build/sim_utils/sim_utils.egg-info/PKG-INFO
+[0.791s] writing dependency_links to ../build/sim_utils/sim_utils.egg-info/dependency_links.txt
+[0.791s] writing entry points to ../build/sim_utils/sim_utils.egg-info/entry_points.txt
+[0.792s] writing requirements to ../build/sim_utils/sim_utils.egg-info/requires.txt
+[0.792s] writing top-level names to ../build/sim_utils/sim_utils.egg-info/top_level.txt
+[0.793s] reading manifest file '../build/sim_utils/sim_utils.egg-info/SOURCES.txt'
+[0.794s] writing manifest file '../build/sim_utils/sim_utils.egg-info/SOURCES.txt'
+[0.794s] running build
+[0.794s] running build_py
+[0.794s] running install
+[0.794s] running install_lib
+[0.796s] running install_data
+[0.796s] running install_egg_info
+[0.797s] removing '/home/justin/sim_ws/src/install/sim_utils/lib/python3.10/site-packages/sim_utils-0.0.0-py3.10.egg-info' (and everything under it)
+[0.798s] Copying ../build/sim_utils/sim_utils.egg-info to /home/justin/sim_ws/src/install/sim_utils/lib/python3.10/site-packages/sim_utils-0.0.0-py3.10.egg-info
+[0.798s] running install_scripts
+[0.815s] Installing red_ball_controller script to /home/justin/sim_ws/src/install/sim_utils/lib/sim_utils
+[0.815s] writing list of installed files to '/home/justin/sim_ws/src/build/sim_utils/install.log'
+[0.837s] Invoked command in '/home/justin/sim_ws/src/sim_utils' returned '0': PYTHONPATH=/home/justin/sim_ws/src/build/sim_utils/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/justin/sim_ws/src/install/sim_utils/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../build/sim_utils build --build-base /home/justin/sim_ws/src/build/sim_utils/build install --record /home/justin/sim_ws/src/build/sim_utils/install.log --single-version-externally-managed install_data
