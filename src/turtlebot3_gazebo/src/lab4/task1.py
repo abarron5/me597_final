@@ -20,14 +20,14 @@ import yaml
 # ---------- TUNABLE PARAMETERS ----------
 OCCUPIED_THRESH = 30          # occupancy grid value >= this is considered an obstacle
 UNKNOWN_VAL = -1
-INFLATE_RADIUS = 5            # smaller by default; adjust if robot footprint requires
+INFLATE_RADIUS = 5           # smaller by default; adjust if robot footprint requires
 GOAL_NEAR_DIST_M = 0.15       # when within this world distance to goal waypoint, pop waypoint
 ALIGN_ANGLE = 0.15            # radians: how close to aligned before driving forward
 MAX_LINEAR_SPEED = 0.6
 MAX_ANGULAR_SPEED = 0.8
 OBSTACLE_FRONT_THRESH = 0.40  # meters
 REPLAN_INTERVAL = 1.0         # seconds between forced replans
-STUCK_TIME = 4.0              # seconds to consider stuck
+STUCK_TIME = 3.0              # seconds to consider stuck
 STUCK_MOVE_THRESH = 0.05      # meters moved to consider not stuck
 BACKUP_TIME = 0.6             # seconds to back up on recovery
 RECOVERY_ROTATE_TIME = 1.0    # seconds to rotate during recovery
@@ -97,7 +97,6 @@ class Task1(Node):
         # Exploration bias: persistent exploration direction in world coords (unit vector)
         # Set to None initially; once we pick a first frontier we store the direction to keep going.
         self.exploration_dir = None
-        self.EXPLORE_ANGLE_LIMIT = math.radians(60)   # cone +/- 60 degrees
 
         # frontier visit bookkeeping
         self.visited_mask = None           # numpy bool array same shape as map
@@ -110,6 +109,10 @@ class Task1(Node):
         # path-following helper
         self.last_path_idx = 0
         self.last_follow_time = time.time()
+        
+        self.start_time = time.time()
+        self.time = 0.0
+
         self.get_logger().info("Task 1 node started.")
 
     # ---------------- TIMER LOOP ----------------
@@ -130,8 +133,8 @@ class Task1(Node):
             return
 
         # ---------------- STUCK CHECK ----------------
-        """if self._check_stuck(now):
-            return"""
+        if self._check_stuck(now):
+            return
 
         # ---------------- FOLLOW CURRENT PATH ----------------
         if self.current_path and self.current_path_world:
@@ -175,14 +178,20 @@ class Task1(Node):
                 self.current_path_world = []
                 self.last_path_idx = 0
 
+            if int(now - self.start_time) % 60 == 0:
+                self.get_logger().info(f"Time: {int(now - self.start_time) / 60} minute(s)")
+
             return
 
         # ---------------- PLAN NEW PATH ----------------
         if now - self.last_plan_time > REPLAN_INTERVAL or not self.current_path:
             #self.get_logger().info(f"{self.plan_to_frontier(farthest=False)}")
+
             if not self.plan_to_frontier(farthest=False):
                 self.get_logger().info("🎉 Map complete (or no reachable frontiers). Stopping.")
                 self.cmd_pub.publish(Twist())
+                self.time = now - self.start_time
+                self.get_logger().info(f"{int(self.time)} seconds")
                 return
             # when we set current_path_world in plan_to_frontier we will smooth it there
             self.last_plan_time = now
@@ -224,6 +233,9 @@ class Task1(Node):
         self.cmd_pub.publish(cmd)
 
     def _check_stuck(self, now):
+        if time.time() - self.start_time < 20:
+            return False
+        
         if not hasattr(self, "last_cmd"):
             return False
 
@@ -298,7 +310,6 @@ class Task1(Node):
         self.front = median_in_sector(FRONT)
         self.left  = median_in_sector(LEFT)
         self.right = median_in_sector(RIGHT)
-
 
     # ---------------- ODOM ----------------
     def odom_callback(self, msg):
@@ -456,7 +467,10 @@ class Task1(Node):
         
         # Get frontiers
         frontiers = self.get_frontier_cells()
-        self.get_logger().info(f"Frontiers found: {len(frontiers)}")
+
+        frontier_list = frontiers            # keep original
+        frontier_count = len(frontier_list)  # new variable
+        self.get_logger().info(f"Frontiers found: {frontier_count}")
         
         if not frontiers:
             return 0
@@ -471,7 +485,7 @@ class Task1(Node):
                 continue
             # skip if failed too many times
             fail_count = self.failed_frontiers.get((fx, fy), 0)
-            if len(frontiers) > 30 and fail_count >= self.FAILED_LIMIT:
+            if frontier_count > 30 and fail_count >= self.FAILED_LIMIT:
                 # clear failed entry if stale
                 ts = self._failed_timestamps.get((fx, fy), 0)
                 if now - ts > self.FAILED_CLEAR_TIME:
@@ -485,7 +499,7 @@ class Task1(Node):
 
         if not filtered_frontiers:
             self.get_logger().info("No frontiers after filtering")
-            frontiers = self.option2(frontiers, now)
+            self.option2()
             return frontiers
 
         # Find path distance to each frontier
@@ -507,7 +521,7 @@ class Task1(Node):
         reachable_mask = np.isfinite(path_dists)
         if not np.any(reachable_mask):
             self.get_logger().warn("⚠ No reachable frontiers (path distance).")
-            frontiers = self.option2(frontiers, now)
+            self.option2()
             return frontiers
 
         F = F[reachable_mask]
@@ -533,7 +547,7 @@ class Task1(Node):
         # -----------------------
         # parameters — tune if necessary
         MAX_FRONTIER_DIST_M = 20.0     # ignore frontiers farther than this (meters)
-        LAMBDA_DIST = 0.6             # distance penalty weight [0..1]
+        LAMBDA_DIST = 0.5             # distance penalty weight [0..1]
 
         # Use path distance instead of straight-line distance
         dist_m = path_dists * float(self.map_res)
@@ -595,28 +609,35 @@ class Task1(Node):
         self.get_logger().info("Reached end of planning")
         return frontiers
     
-    def option2(self, frontiers, now):
-        self.get_logger().info("📍 option 2")
+    def option2(self):
+        """
+        Used when plan_to_frontier cannot find a path.
+        Behavior:
+        1) If front is blocked -> back up slightly & rotate.
+        2) If front is clear -> inch forward in small micro-steps.
+        """
 
-        # ===========================================================
-        # CASE 1: OPEN AHEAD → MOVE FORWARD ~1.0 m
-        # ===========================================================
-        if self.front > 4.0:
-            self.get_logger().warn("➡️  No path, front > 4 m → forward exploration (~1 m).")
+        if self.front is None:
+            self.get_logger().info("⛔ option2: no LIDAR data yet.")
+            return
 
-            target_dist = 1.0   # meters forward
-            steps = 10
+        # ----------------------------------------
+        # CASE 1 — OBSTACLE DIRECTLY AHEAD
+        # ----------------------------------------
+        if self.front < 0.35:  # ~35 cm safety stop
+            self.get_logger().info("⛔ option2: obstacle ahead -> BACKUP + ROTATE")
 
+            # create a micro backup path (0.15 m)
+            backup_dist = -0.15
+            steps = 5
             micro_path_world = []
             micro_path_grid = []
 
             for i in range(1, steps + 1):
-                p = i / steps
-                px = self.robot_x + p * target_dist * math.cos(self.robot_yaw)
-                py = self.robot_y + p * target_dist * math.sin(self.robot_yaw)
-
+                p = i / float(steps)
+                px = self.robot_x + p * backup_dist * math.cos(self.robot_yaw)
+                py = self.robot_y + p * backup_dist * math.sin(self.robot_yaw)
                 micro_path_world.append((px, py))
-
                 gx, gy = self.world_to_grid(px, py)
                 micro_path_grid.append((gx, gy))
 
@@ -624,40 +645,39 @@ class Task1(Node):
             self.current_path = micro_path_grid
             self.path_goal = None
             self.last_path_idx = 0
-            self.last_plan_time = now
+            self.get_logger().info("⬅️ Executing BACKUP micro-path")
 
-            self.get_logger().info("📍 Executing FORWARD micro-path.")
+            # After finishing backup, rotate to clear scan
+            self.recovery_rotate_next = True
+            return
 
-        # ===========================================================
-        # CASE 2: BLOCKED AHEAD → BACK UP ~0.3 m
-        # ===========================================================
-        else:
-            self.get_logger().warn("⬅️  No path, front ≤ 4 m → backing up (~0.3 m).")
+        # ----------------------------------------
+        # CASE 2 — FRONT CLEAR → INCH FORWARD
+        # ----------------------------------------
+        self.get_logger().info("➡️ option2: inching forward")
 
-            target_dist = -0.3   # NEGATIVE = move backward
-            steps = 10
+        inch_dist = 0.10          # 10 cm forward
+        steps = 4                 # subdivided into 4 micro steps
 
-            micro_path_world = []
-            micro_path_grid = []
+        micro_path_world = []
+        micro_path_grid = []
 
-            for i in range(1, steps + 1):
-                p = i / steps
-                px = self.robot_x + p * target_dist * math.cos(self.robot_yaw)
-                py = self.robot_y + p * target_dist * math.sin(self.robot_yaw)
+        for i in range(1, steps + 1):
+            p = i / float(steps)
+            px = self.robot_x + p * inch_dist * math.cos(self.robot_yaw)
+            py = self.robot_y + p * inch_dist * math.sin(self.robot_yaw)
+            micro_path_world.append((px, py))
+            gx, gy = self.world_to_grid(px, py)
+            micro_path_grid.append((gx, gy))
 
-                micro_path_world.append((px, py))
+        self.current_path_world = micro_path_world
+        self.current_path = micro_path_grid
+        self.path_goal = None
+        self.last_path_idx = 0
 
-                gx, gy = self.world_to_grid(px, py)
-                micro_path_grid.append((gx, gy))
+        self.get_logger().info("📍 Executing INCH micro-path (20 cm)")
+        return
 
-            self.current_path_world = micro_path_world
-            self.current_path = micro_path_grid
-            self.path_goal = None
-            self.last_path_idx = 0
-            self.last_plan_time = now
-
-            self.get_logger().info("📍 Executing BACKWARD micro-path.")
-        return frontiers
 
     def find_nearest_free(self, gx, gy, max_r=6):
         for r in range(max_r+1):
