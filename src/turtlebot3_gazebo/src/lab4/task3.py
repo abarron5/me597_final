@@ -179,14 +179,14 @@ class Task3(Node):
 
         # detection
         self.found = {}   # {"red": (x,y), "green": (x,y), "blue": (x,y)}
-        # HSV ranges (low, high) — tune if needed
+        # HSV ranges (low, high)
         self.color_ranges = {
             "red":   [(0, 170, 120), (10, 255, 255)],
             "green": [(40, 120, 120), (80, 255, 255)],
             "blue":  [(90, 170, 120), (130, 255, 255)]
         }
 
-        # timer loop
+        # timer loops
         self.timer = self.create_timer(0.1, self.timer_cb)
         self.status_timer = self.create_timer(1.0, self.print_ball_status)
 
@@ -995,7 +995,7 @@ class Task3(Node):
 
             for gy in sweep_rows:
                 # must be free in RAW map
-                if raw[gy, gx] >= 50:      # 50 = your free/occupied threshold
+                if raw[gy, gx] >= OCCUPIED_THRESH:
                     continue
 
                 if not is_safe(gx, gy):
