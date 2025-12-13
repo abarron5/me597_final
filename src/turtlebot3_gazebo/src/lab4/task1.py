@@ -2,10 +2,12 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
 
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import OccupancyGrid, Odometry
-from geometry_msgs.msg import Twist
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from std_msgs.msg import Header
+from geometry_msgs.msg import Twist, PoseStamped
 import numpy as np
 import math
 import time
@@ -18,20 +20,20 @@ import yaml
 
 
 # ---------- TUNABLE PARAMETERS ----------
-OCCUPIED_THRESH = 30          # occupancy grid value >= this is considered an obstacle
+OCCUPIED_THRESH = 15          # occupancy grid value >= this is considered an obstacle
 UNKNOWN_VAL = -1
 INFLATE_RADIUS = 5           # smaller by default; adjust if robot footprint requires
-GOAL_NEAR_DIST_M = 0.15       # when within this world distance to goal waypoint, pop waypoint
-ALIGN_ANGLE = 0.15            # radians: how close to aligned before driving forward
+GOAL_NEAR_DIST_M = 0.1       # when within this world distance to goal waypoint, pop waypoint
+ALIGN_ANGLE = 0.1            # radians: how close to aligned before driving forward
 MAX_LINEAR_SPEED = 0.6
 MAX_ANGULAR_SPEED = 0.8
-OBSTACLE_FRONT_THRESH = 0.40  # meters
 REPLAN_INTERVAL = 1.0         # seconds between forced replans
-STUCK_TIME = 3.0              # seconds to consider stuck
+STUCK_TIME = 5.0              # seconds to consider stuck
 STUCK_MOVE_THRESH = 0.05      # meters moved to consider not stuck
 BACKUP_TIME = 0.6             # seconds to back up on recovery
 RECOVERY_ROTATE_TIME = 1.0    # seconds to rotate during recovery
 MIN_FRONTIER_GRID_DIST = 6    # minimum grid cells away from robot to accept frontier
+EMERGENCY_STOP = 0.40
 # ----------------------------------------
 
 
@@ -40,6 +42,8 @@ class Task1(Node):
     def __init__(self):
         super().__init__('task1_algorithm')
 
+        qos = QoSProfile(depth=10)
+
         # Subscribers
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
@@ -47,6 +51,8 @@ class Task1(Node):
 
         # Publisher
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.path_pub = self.create_publisher(Path, 'global_plan', qos)
+
         self.timer = self.create_timer(0.1, self.timer_cb)
 
         # Robot pose
@@ -74,6 +80,7 @@ class Task1(Node):
         self.current_path_world = []    # list of waypoints in world coords (wx,wy)
         self.path_goal = None           # grid goal (gx,gy)
         self.last_plan_time = 0.0
+        self.global_path = None
 
         # Stuck detection
         self.last_pos = (0.0, 0.0)
@@ -105,12 +112,14 @@ class Task1(Node):
         self.FAILED_LIMIT = 5              # after this many A* fails, temporarily ignore frontier
         self.FAILED_CLEAR_TIME = 1.0      # seconds after which failed_frontiers entry may be dropped
         self._failed_timestamps = {}       # {(gx,gy): last_fail_time}
+        self.frontier_count = 100
 
         # path-following helper
         self.last_path_idx = 0
         self.last_follow_time = time.time()
         
         self.start_time = time.time()
+        self.end_time = time.time()
         self.time = 0.0
 
         self.get_logger().info("Task 1 node started.")
@@ -187,11 +196,15 @@ class Task1(Node):
         if now - self.last_plan_time > REPLAN_INTERVAL or not self.current_path:
             #self.get_logger().info(f"{self.plan_to_frontier(farthest=False)}")
 
-            if not self.plan_to_frontier(farthest=False):
+            if self.frontier_count > 0:
+                self.plan_to_frontier(farthest=False)
+                self.end_time = time.time()
+            else:
                 self.get_logger().info("🎉 Map complete (or no reachable frontiers). Stopping.")
                 self.cmd_pub.publish(Twist())
                 self.time = now - self.start_time
-                self.get_logger().info(f"{int(self.time)} seconds")
+                total = int(self.end_time - self.start_time)
+                self.get_logger().info(f"{int(total / 60)} minutes {total % 60} seconds")
                 return
             # when we set current_path_world in plan_to_frontier we will smooth it there
             self.last_plan_time = now
@@ -269,6 +282,10 @@ class Task1(Node):
         self.current_path_world = []
         self.path_goal = None
         self.last_path_idx = 0
+        path = Path()
+        path.header.frame_id = "map"
+        path.header.stamp = self.get_clock().now().to_msg()
+        self.path_pub.publish(path)
 
     # ---------------- LIDAR ----------------
     def scan_callback(self, msg):
@@ -469,8 +486,8 @@ class Task1(Node):
         frontiers = self.get_frontier_cells()
 
         frontier_list = frontiers            # keep original
-        frontier_count = len(frontier_list)  # new variable
-        self.get_logger().info(f"Frontiers found: {frontier_count}")
+        self.frontier_count = len(frontier_list)  # new variable
+        self.get_logger().info(f"Frontiers found: {self.frontier_count}")
         
         if not frontiers:
             return 0
@@ -485,7 +502,7 @@ class Task1(Node):
                 continue
             # skip if failed too many times
             fail_count = self.failed_frontiers.get((fx, fy), 0)
-            if frontier_count > 30 and fail_count >= self.FAILED_LIMIT:
+            if fail_count >= self.FAILED_LIMIT:
                 # clear failed entry if stale
                 ts = self._failed_timestamps.get((fx, fy), 0)
                 if now - ts > self.FAILED_CLEAR_TIME:
@@ -500,7 +517,7 @@ class Task1(Node):
         if not filtered_frontiers:
             self.get_logger().info("No frontiers after filtering")
             self.option2()
-            return frontiers
+            return True
 
         # Find path distance to each frontier
         rx, ry = self.world_to_grid(self.robot_x, self.robot_y)
@@ -522,7 +539,7 @@ class Task1(Node):
         if not np.any(reachable_mask):
             self.get_logger().warn("⚠ No reachable frontiers (path distance).")
             self.option2()
-            return frontiers
+            return True
 
         F = F[reachable_mask]
         dx = dx[reachable_mask]
@@ -558,7 +575,7 @@ class Task1(Node):
 
         # score: favor alignment, penalize distance.
         # Range roughly in [-1 - lambda, 1]
-        scores = dots - LAMBDA_DIST * dist_norm        
+        scores = -dist_norm + 0.10 * dots        
         candidate_order = np.argsort(scores)[::-1]
 
         # Try each candidate in ranked order
@@ -586,7 +603,9 @@ class Task1(Node):
                 # convert to world coords
                 self.current_path_world = [self.grid_to_world(x, y) for x, y in path]
                 # smooth path for better following (use small window)
-                self.current_path_world = self.smooth_path(self.current_path_world, window=1)
+                if self.path_has_clearance(self.current_path, min_clear_cells=2):
+                    self.current_path_world = self.smooth_path(self.current_path_world, window=1)
+
 
                 # store frontier (not safe target)
                 self.path_goal = frontier
@@ -599,7 +618,28 @@ class Task1(Node):
                 self.get_logger().info(f"📍 Path to frontier={frontier} via safe={safe_target}, len={len(path)}")
                 # reset path following index
                 self.last_path_idx = 0
-                return frontiers
+
+                # convert grid path to world coordinates and publish Path
+                path_msg = Path()
+                path_msg.header = Header()
+                path_msg.header.stamp = self.get_clock().now().to_msg()
+                path_msg.header.frame_id = "map"
+
+                self.path_world = []
+                for (gx_i, gy_i) in path:
+                    x,y = self.grid_to_world(gx_i, gy_i)
+                    ps = PoseStamped()
+                    ps.header = path_msg.header
+                    ps.pose.position.x = x
+                    ps.pose.position.y = y
+                    path_msg.poses.append(ps)
+                    self.path_world.append((x,y))
+
+                self.global_path = path_msg
+                
+                self.path_pub.publish(self.global_path)
+                self.get_logger().info(f"A* planned path with {len(self.path_world)} waypoints.")
+                return True
 
             # A* failed → mark this frontier failed
             self.failed_frontiers[frontier] = self.failed_frontiers.get(frontier, 0) + 1
@@ -607,7 +647,7 @@ class Task1(Node):
             #self.get_logger().info("No path")
 
         self.get_logger().info("Reached end of planning")
-        return frontiers
+        return True
     
     def option2(self):
         """
@@ -620,11 +660,13 @@ class Task1(Node):
         if self.front is None:
             self.get_logger().info("⛔ option2: no LIDAR data yet.")
             return
+        
+        self.get_logger().info(f"Front dist: {self.front}")
 
         # ----------------------------------------
         # CASE 1 — OBSTACLE DIRECTLY AHEAD
         # ----------------------------------------
-        if self.front < 0.35:  # ~35 cm safety stop
+        if self.front < 1.5:  # ~1.5 m safety stop
             self.get_logger().info("⛔ option2: obstacle ahead -> BACKUP + ROTATE")
 
             # create a micro backup path (0.15 m)
@@ -656,7 +698,7 @@ class Task1(Node):
         # ----------------------------------------
         self.get_logger().info("➡️ option2: inching forward")
 
-        inch_dist = 0.10          # 10 cm forward
+        inch_dist = 0.05          # 10 cm forward
         steps = 4                 # subdivided into 4 micro steps
 
         micro_path_world = []
@@ -677,6 +719,17 @@ class Task1(Node):
 
         self.get_logger().info("📍 Executing INCH micro-path (20 cm)")
         return
+    
+    def path_has_clearance(self, path, min_clear_cells=1):
+        for gx, gy in path:
+            y0 = max(0, gy - min_clear_cells)
+            y1 = min(self.map_height, gy + min_clear_cells + 1)
+            x0 = max(0, gx - min_clear_cells)
+            x1 = min(self.map_width, gx + min_clear_cells + 1)
+            if np.any(self.inflated_map[y0:y1, x0:x1] == 1):
+                return False
+        return True
+
 
 
     def find_nearest_free(self, gx, gy, max_r=6):
@@ -928,20 +981,20 @@ class Task1(Node):
         # If obstacle close in front, slow more
         if hasattr(self, "front") and self.front < 1.0:
             speed = speed * self.front
-        elif hasattr(self, "front") and self.front < 0.5:
-            speed = min(speed * self.front, 0.06)
+        """elif hasattr(self, "front") and self.front < 0.5 :
+            speed = min(speed * self.front, 0.06)"""
 
         return speed, heading, dist
 
-    def move_ttbot(self, speed, heading):
-        """Publish Twist using speed and heading (heading here is angular.z command)."""
-        cmd = Twist()
-        cmd.linear.x = speed
-        cmd.angular.z = heading
-        self.cmd_pub.publish(cmd)
-
     def move_ttbot_safe(self, speed, heading):
         """Publish Twist but clamp to safe ranges."""
+        #self.get_logger().info(f"Front dist: {self.front}")
+        if self.front < EMERGENCY_STOP:
+            self.cmd_pub.publish(Twist())
+            self._reset_path()
+            self.get_logger().info("Too close. Replanning")
+            speed = 0.0
+            heading = 0.8
         cmd = Twist()
         cmd.linear.x = max(0.0, min(speed, MAX_LINEAR_SPEED))
         cmd.angular.z = max(-MAX_ANGULAR_SPEED, min(heading, MAX_ANGULAR_SPEED))
