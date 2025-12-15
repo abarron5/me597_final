@@ -14,7 +14,7 @@ from collections import deque
 import heapq
 
 # tuning
-INFLATE_RADIUS_CELLS = 5        # inflate obstacles by this many cells
+INFLATE_RADIUS_CELLS = 6        # inflate obstacles by this many cells
 OCCUPIED_THRESH = 65            # map values >= this are occupied
 LOOKAHEAD_M = 0.30
 FRONT_OBSTACLE_THRESHOLD = 0.5  # m -> treat as obstacle blocking
@@ -154,6 +154,7 @@ class Task2(Node):
         self.dynamic_add = 80             # cost per injection
         self.dynamic_decay = 1            # cost removed per timer tick
         self.dynamic_thresh = 40          # >= this -> obstacle
+        self.obstacle_radius = 0.35
 
 
         # timer loop
@@ -462,7 +463,7 @@ class Task2(Node):
             return
 
         gx, gy = self.world_to_grid(wx, wy)
-        r = max(1, int(0.35 / self.map_res))
+        r = max(1, int(self.obstacle_radius / self.map_res))
 
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):

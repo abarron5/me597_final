@@ -5,6 +5,9 @@ from rclpy.qos import QoSProfile, QoSHistoryPolicy
 
 from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, Point
+from visualization_msgs.msg import Marker
+from std_msgs.msg import ColorRGBA
+
 from sensor_msgs.msg import LaserScan, Image
 from std_msgs.msg import Header
 
@@ -16,12 +19,13 @@ from cv_bridge import CvBridge
 import cv2 as cv
 
 # tuning
-INFLATE_RADIUS_CELLS = 5        # inflate obstacles by this many cells
+INFLATE_RADIUS_CELLS = 6        # inflate obstacles by this many cells
+INFLATE_ROOM_RADIUS_CELLS = 10
 OCCUPIED_THRESH = 65            # map values >= this are occupied
 LOOKAHEAD_M = 0.30
-FRONT_OBSTACLE_THRESHOLD = 0.6  # m -> treat as obstacle blocking
-FRONT_ANGLE_DEG = 25             # degrees on each side for front sector
-MAX_LINEAR_SPEED = 0.16
+FRONT_OBSTACLE_THRESHOLD = 0.4  # m -> treat as obstacle blocking
+FRONT_ANGLE_DEG = 35             # degrees on each side for front sector
+MAX_LINEAR_SPEED = 0.2
 MAX_ANGULAR_SPEED = 0.8
 GOAL_NEAR_DIST_M = 0.25
 LIDAR_FORWARD_OFFSET = math.radians(0)
@@ -138,16 +142,23 @@ class Task3(Node):
         # Publishers
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', qos)
         self.path_pub = self.create_publisher(Path, 'global_plan', qos)
+        self.work_map_pub = self.create_publisher(OccupancyGrid, '/working_map', map_qos)
 
         self.red_pub   = self.create_publisher(Point, "/red_pos", 10)
         self.green_pub = self.create_publisher(Point, "/green_pos", 10)
         self.blue_pub  = self.create_publisher(Point, "/blue_pos", 10)
+
+        self.marker_pub = self.create_publisher(Marker, "/ball_markers", 10)
+        self.search_marker_pub = self.create_publisher(Marker, "/search_points", 10)
+
+
 
         # State
         self.map_msg = None
         self.map_arr = None            # numpy array [H, W] flipped (row0 top)
         self.map_loaded = False
         self.inf_map = None            # inflated binary map: 1->obstacle, 0->free
+        self.room_map = None
         self.map_res = None
         self.map_origin = (0.0, 0.0)
         self.map_width = 0
@@ -162,6 +173,13 @@ class Task3(Node):
         self.lidar = None              # last LaserScan
         self.ranges = None
 
+        # --- dynamic obstacle layer ---
+        self.dynamic_cost = None          # uint8 [0..100]
+        self.dynamic_add = 80             # cost per injection
+        self.dynamic_decay = 4            # cost removed per timer tick
+        self.dynamic_thresh = 40          # >= this -> obstacle
+        self.obstacle_radius = 0.35
+
         # search-specific
         self.search_points = deque()
         self.search_generated = False
@@ -170,6 +188,8 @@ class Task3(Node):
         self.frame_skip = 3
         self.frame_count = 0
 
+        self.min_ball_area = 2000
+        self.best_area = {"red": 0, "green": 0, "blue": 0}
 
         self.detected_balls = {
             "red": None,
@@ -219,6 +239,7 @@ class Task3(Node):
             binmap = np.zeros_like(arr, dtype=np.uint8)
             binmap[arr >= OCCUPIED_THRESH] = 1
             self.inf_map = self.inflate(binmap, INFLATE_RADIUS_CELLS)
+            self.room_map = self.inflate(binmap, INFLATE_ROOM_RADIUS_CELLS)
             self.map_loaded = True
             self.get_logger().info(f"Map received: size=({H},{W}), res={self.map_res:.3f}")
 
@@ -226,6 +247,9 @@ class Task3(Node):
             if not self.search_generated:
                 self.generate_search_points()
                 self.search_generated = True
+            
+            if self.dynamic_cost is None:
+                self.dynamic_cost = np.zeros_like(self.inf_map, dtype=np.uint8)
 
         except Exception as e:
             self.get_logger().error(f"Exception in map_cb: {e}")
@@ -361,8 +385,8 @@ class Task3(Node):
 
         # ---------- SAME LOGIC YOU KNOW WORKS ----------
         for color, (lo, hi) in self.color_ranges.items():
-            if color in self.found:
-                continue
+            """if color in self.found:
+                continue"""
 
             # Mask
             mask = cv.inRange(hsv, np.array(lo), np.array(hi))
@@ -379,8 +403,13 @@ class Task3(Node):
             # Largest contour
             c = max(cnts, key=cv.contourArea)
             area = cv.contourArea(c)
-            if area < 500:  # conservative threshold
+            #self.get_logger().info(f"Area: {area}")
+
+            if area < self.min_ball_area:
                 continue
+            if area < 1.1 * self.best_area[color]:
+                continue
+            self.best_area[color] = area
 
             x, y, w_box, h_box = cv.boundingRect(c)
             cx = x + w_box / 2
@@ -434,6 +463,8 @@ class Task3(Node):
         # If map not yet loaded, wait
         if not self.map_loaded:
             return
+        
+        self.decay_dynamic_cost()
 
         # If we've found all balls, ensure robot stopped and do nothing
         if len(self.found) >= 3:
@@ -460,6 +491,14 @@ class Task3(Node):
 
         # follow path
         self.follow_path()
+
+    def decay_dynamic_cost(self):
+        if self.dynamic_cost is None:
+            return
+        self.dynamic_cost = np.maximum(
+            0,
+            self.dynamic_cost.astype(int) - self.dynamic_decay
+        ).astype(np.uint8)
 
      # ---------------- map helpers ----------------
     def inflate(self, binmap, radius_cells):
@@ -568,23 +607,23 @@ class Task3(Node):
         except Exception:
             self.get_logger().warn("start/goal outside inf_map bounds")
 
-        # working map for local replan
         working_map = self.inf_map.copy()
 
         if local_replan and self.is_obstacle_blocking_next_waypoint():
             ox, oy = self.find_closest_front_point()
             if ox is not None:
-                cgx, cgy = self.world_to_grid(ox, oy)
-                r = max(1, int(0.55 / self.map_res))   # radius in cells
-                for dx in range(-r, r + 1):
-                    for dy in range(-r, r + 1):
-                        # circle mask
-                        if dx*dx + dy*dy > r*r:
-                            continue
-                        nx = cgx + dx
-                        ny = cgy + dy
-                        if 0 <= nx < self.map_width and 0 <= ny < self.map_height:
-                            working_map[ny, nx] = 1
+                self.inject_dynamic_obstacle(ox, oy)
+
+        # convert dynamic cost -> binary obstacle layer
+        dyn_bin = (self.dynamic_cost >= self.dynamic_thresh).astype(np.uint8)
+        working_map = np.maximum(working_map, dyn_bin)
+
+        
+        vis = np.maximum(self.inf_map * 100, self.dynamic_cost)
+        self.publish_working_map((vis >= 50).astype(np.uint8))
+
+        # DEBUG: publish inflated occupancy directly
+        #self.publish_working_map(self.room_map.astype(np.uint8))
 
         # run A*
         path = self.astar_grid(start_g, goal_g, map_bin=working_map)
@@ -593,10 +632,6 @@ class Task3(Node):
             self.get_logger().warn("A* failed to find a path.")
             self.global_path = None
             self.path_world = []
-            """if self.find_closest_front_point > 2.0:
-                speed = 0.1
-                heading = 0.0
-                self.move_ttbot_safe(speed, heading)"""
             return False
 
         # convert grid path to world coordinates and publish Path
@@ -622,6 +657,25 @@ class Task3(Node):
         return True
 
     # ---------------- obstacle helpers ----------------
+    def inject_dynamic_obstacle(self, wx, wy):
+        if self.dynamic_cost is None:
+            return
+
+        gx, gy = self.world_to_grid(wx, wy)
+        r = max(1, int(self.obstacle_radius / self.map_res))
+
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if dx*dx + dy*dy > r*r:
+                    continue
+                x = gx + dx
+                y = gy + dy
+                if 0 <= x < self.map_width and 0 <= y < self.map_height:
+                    self.dynamic_cost[y, x] = min(
+                        100,
+                        self.dynamic_cost[y, x] + self.dynamic_add
+                    )
+
     def is_obstacle_blocking_next_waypoint(self):
         if self.lidar is None or not self.path_world:
             return False
@@ -858,284 +912,98 @@ class Task3(Node):
         self.cmd_pub.publish(cmd)
 
     # ---------------- search helpers ---------------- 
-    def generate_search_points_work(self):
-        
-        #Robust room segmentation with fallback.
-        #1. Close narrow halls -> segment rooms.
-        #2. Extract large connected regions.
-        #3. Use region centroid as a search target.
-        #4. If segmentation fails, fall back to grid sampling.
-        
-        if self.inf_map is None:
-            return
-
-        H, W = self.inf_map.shape
-        free = (self.inf_map == 0).astype(np.uint8)
-
-        # ---- STEP 1: CLOSE DOORS & HALLWAYS ----
-        # This kernel closes ~0.3m gaps (tunable)
-        kernel = np.ones((7, 7), np.uint8)
-        closed = cv.morphologyEx(free, cv.MORPH_CLOSE, kernel, iterations=2)
-
-        # ---- STEP 2: CONNECTED COMPONENTS ----
-        num, labels = cv.connectedComponents(closed)
-
-        pts = []
-
-        for label in range(1, num):
-            ys, xs = np.where(labels == label)
-            size = len(xs)
-
-            # Ignore tiny hallway fragments
-            if size < 500:
-                continue
-
-            # Compute region centroid
-            cgx = int(np.mean(xs))
-            cgy = int(np.mean(ys))
-
-            # Convert to world
-            wx, wy = self.grid_to_world(cgx, cgy)
-
-            # Double check it's valid in the *real* free map
-            if self.inf_map[cgy, cgx] == 0:
-                pts.append((wx, wy))
-
-        # ---- STEP 3: GUARANTEE NON-EMPTY RESULT ----
-        if len(pts) == 0:
-            self.get_logger().warn("Room segmentation failed → falling back to grid sampling.")
-            pts = []
-            step = max(1, int(2.0 / self.map_res))  # about 2 m spacing
-            for gy in range(0, H, step):
-                for gx in range(0, W, step):
-                    if self.inf_map[gy, gx] == 0:
-                        xw, yw = self.grid_to_world(gx, gy)
-                        pts.append((xw, yw))
-
-        # ---- STEP 4: FINAL GUARANTEE ----
-        if len(pts) == 0:
-            self.get_logger().error("NO SEARCH POINTS FOUND. Map may be invalid.")
-            pts = [(0, 0)]  # won't happen in practice but avoids crashing
-
-        np.random.shuffle(pts)
-        self.search_points = deque(pts)
-
-        self.get_logger().info(f"Generated {len(pts)} search points.")
-    
-    def generate_search_points(self,
-                            spacing_m=1.2,      # how dense in free space
-                            safe_margin_m=0.15  # keep robot + inflation away from walls/balls
-                            ):
+    def generate_search_points(self):
         """
-        SIMPLE + RELIABLE GLOBAL SWEEP SEARCH
-        ------------------------------------
-        - Samples the RAW MAP (self.map_arr) so doorways stay open.
-        - Uses INFLATED MAP (self.inf_map) for safety margin checks.
-        - Produces a deterministic boustrophedon sweep (zig-zag).
-        - Guarantees full coverage of all rooms.
-        - Rejects points too close to:
-            * walls
-            * doorframes
-            * balls / obstacles (if your inflation layer marks them)
-        - Always returns a point set.
+        ROOM-BASED SEARCH (CLEAN + ROBUST)
+        ---------------------------------
+        - Uses inflated map for safety
+        - Uses EXTRA inflation to close doorways
+        - Finds rooms via connected components
+        - Chooses 1–2 interior points per room
         """
 
-        from collections import deque
-
-        # ---- safety checks ----
-        if self.map_arr is None or self.inf_map is None or self.map_res is None:
+        if self.room_map is None:
             self.get_logger().warn("generate_search_points(): map not ready")
-            return []
-
-        raw = self.map_arr          # RAW occupancy (keeps doorways open)
-        inf = self.inf_map          # INFLATED map (keeps us safe)
-        H, W = raw.shape
-
-        # parameters → cells
-        step = max(1, int(round(spacing_m / self.map_res)))
-        margin = max(1, int(round(safe_margin_m / self.map_res)))
-
-        self.get_logger().info(
-            f"[SEARCH] spacing={spacing_m}m({step} cells), margin={safe_margin_m}m({margin} cells)"
-        )
-
-        # safety check helper (inflated map)
-        def is_safe(gx, gy):
-            """Reject points too close to walls/balls/obstacles."""
-            if gx < margin or gy < margin or gx >= W - margin or gy >= H - margin:
-                return False
-
-            # must be free in inflated map
-            patch = inf[gy - margin: gy + margin + 1,
-                        gx - margin: gx + margin + 1]
-            return np.all(patch == 0)
-
-        # choose sweep direction based on robot position
-        start_from_top = False
-        try:
-            rx, ry = self.pose.position.x, self.pose.position.y
-            rgx, rgy = self.world_to_grid(rx, ry)
-            start_from_top = (rgy < H // 2)
-            self.get_logger().info(f"[SEARCH] robot at grid=({rgx},{rgy}) start_from_top={start_from_top}")
-        except:
-            pass
-
-        # -------- build sampling grid --------
-        pts = []
-        rows = range(margin, H - margin, step)
-        cols = range(margin, W - margin, step)
-
-        for col_i, gx in enumerate(cols):
-
-            # zig-zag direction
-            if (col_i % 2 == 0) ^ start_from_top:
-                sweep_rows = rows
-            else:
-                sweep_rows = reversed(list(rows))
-
-            for gy in sweep_rows:
-                # must be free in RAW map
-                if raw[gy, gx] >= OCCUPIED_THRESH:
-                    continue
-
-                if not is_safe(gx, gy):
-                    continue
-
-                # convert to world
-                wx, wy = self.grid_to_world(gx, gy)
-                pts.append((wx, wy))
-
-        # -------- fallback if empty --------
-        if not pts:
-            self.get_logger().warn("[SEARCH] No points found — using coarse fallback")
-            for gy in range(0, H, max(1, step)):
-                for gx in range(0, W, max(1, step)):
-                    if raw[gy, gx] < 50:
-                        if is_safe(gx, gy):
-                            pts.append(self.grid_to_world(gx, gy))
-
-        if not pts:
-            pts = [(0.0, 0.0)]
-            self.get_logger().error("[SEARCH] STILL empty — fallback to (0,0)")
-
-        # assign queue
-        self.search_points = deque(pts)
-
-        self.get_logger().info(f"[SEARCH] Generated {len(pts)} safe global sweep points")
-        return pts
-
-    
-    def generate_search_points_latest(self):
-        """
-        Deterministic room-by-room sweeping search.
-        - free = occ < 50
-        - morphological closing to merge small gaps
-        - connected components -> rooms
-        - rooms sorted left→right→top→bottom
-        - 3×3 interior safe samples in each room
-        - fallback to coarse grid sampling if segmentation fails
-        """
-        if self.inf_map is None:
-            self.get_logger().warn("generate_search_points() called but inf_map is None")
             return
 
-        occ = self.inf_map
-        H, W = occ.shape
+        # -----------------------------
+        # 2. Connected components = rooms
+        # -----------------------------
+        free = (self.room_map == 0).astype(np.uint8)
+        num_labels, labels = cv.connectedComponents(free)
 
-        # ---- FREE MASK USING NEW RULE ----
-        free_mask = (occ < 5).astype(np.uint8)
-        self.get_logger().info(f"[DEBUG] Free mask created: free_count={np.sum(free_mask)}")
-
-        # ---- STEP 1: CLOSE SMALL DOORS/HALLWAYS ----
-        kernel = np.ones((10, 10), np.uint8)
-        closed = cv.morphologyEx(free_mask, cv.MORPH_CLOSE, kernel, iterations=2)
-        self.get_logger().info("[DEBUG] Morphological closing complete")
-
-        # ---- STEP 2: CONNECTED COMPONENTS (ROOM FINDING) ----
-        num_labels, labels = cv.connectedComponents(closed)
-        self.get_logger().info(f"[DEBUG] Connected components found: {num_labels - 1}")
 
         rooms = []
-        for label in range(1, num_labels):
-            ys, xs = np.where(labels == label)
+        for lab in range(1, num_labels):
+            ys, xs = np.where(labels == lab)
             size = len(xs)
 
-            self.get_logger().info(f"[DEBUG] Region {label}: size={size}")
-
-            # skip tiny rooms/hallway slivers
-            if size < 500:
+            # Ignore tiny junk regions
+            if size < 400:
                 continue
 
+            rooms.append({
+                "xs": xs,
+                "ys": ys,
+                "size": size,
+                "cx": xs.mean(),
+                "cy": ys.mean()
+            })
+
+        self.get_logger().info(
+            f"[ROOM DEBUG] inf_map free cells: {np.sum(self.inf_map == 0)}")
+        self.get_logger().info(
+            f"[ROOM DEBUG] detected rooms: {len(rooms)}")
+
+        if not rooms:
+            self.get_logger().warn("Room detection failed — falling back to coarse grid")
+            return self._fallback_grid_sampling(self.inf_map)
+
+
+        # Sort rooms left → right
+        rooms.sort(key=lambda r: r["cx"])
+
+        # -----------------------------
+        # 3. Choose points per room
+        # -----------------------------
+        pts = []
+
+        for r in rooms:
+            xs, ys = r["xs"], r["ys"]
+            size = r["size"]
+
+            # bounding box
             x_min, x_max = xs.min(), xs.max()
             y_min, y_max = ys.min(), ys.max()
 
-            rooms.append({
-                "id": label,
-                "cx": float(xs.mean()),
-                "cy": float(ys.mean()),
-                "bbox": (x_min, x_max, y_min, y_max),
-            })
+            # how many points?
+            if size < 3000:
+                samples = 1
+            else:
+                samples = 2
 
-        if not rooms:
-            self.get_logger().warn("No rooms detected! Falling back immediately.")
-            return self._fallback_grid_sampling(occ)
+            for i in range(samples):
+                # interior bias (avoid walls)
+                fx = 0.4 + 0.2 * i
+                fy = 0.5
 
-        # ---- SORT ROOMS LEFT→RIGHT THEN TOP→BOTTOM ----
-        rooms.sort(key=lambda r: (r["cx"], r["cy"]))
-        self.get_logger().info(f"[DEBUG] Rooms sorted: {len(rooms)} rooms")
+                gx = int(x_min + fx * (x_max - x_min))
+                gy = int(y_min + fy * (y_max - y_min))
 
-        pts = []
+                # snap to nearest safe cell
+                gx, gy = self.find_nearest_free((gx, gy))
 
-        def is_safe(gx, gy):
-            """Check if inflated map says this pixel is safe."""
-            if gx < 3 or gy < 3 or gx >= W - 3 or gy >= H - 3:
-                return False
-            if occ[gy, gx] >= 50:
-                return False
-            for dy in range(-3, 4):
-                for dx in range(-3, 4):
-                    if occ[gy + dy, gx + dx] >= 50:
-                        return False
-            return True
+                wx, wy = self.grid_to_world(gx, gy)
+                pts.append((wx, wy))
 
-        # ---- SAMPLE EACH ROOM WITH A 3×3 INTERIOR GRID ----
-        for rm in rooms:
-            x_min, x_max, y_min, y_max = rm["bbox"]
-            width = x_max - x_min
-            height = y_max - y_min
-
-            # interior samples
-            grid_x = np.linspace(x_min + 0.2 * width, x_max - 0.2 * width, 3)
-            grid_y = np.linspace(y_min + 0.2 * height, y_max - 0.2 * height, 3)
-
-            self.get_logger().info(
-                f"[DEBUG] Room {rm['id']} bbox=({x_min},{x_max},{y_min},{y_max}) generating grid samples"
-            )
-
-            for px in grid_x:
-                for py in grid_y:
-                    gx, gy = int(px), int(py)
-                    if is_safe(gx, gy):
-                        wx, wy = self.grid_to_world(gx, gy)
-                        pts.append((wx, wy))
-                        self.get_logger().info(
-                            f"[DEBUG] Added search point at world ({wx:.2f}, {wy:.2f})"
-                        )
-                    else:
-                        self.get_logger().info(
-                            f"[DEBUG] Point ({gx},{gy}) rejected by safety check"
-                        )
-
-        # ---- FALLBACK IF NO SAMPLES ----
-        if len(pts) == 0:
-            self.get_logger().warn("Room sampling failed → fallback coarse grid sampling.")
-            return self._fallback_grid_sampling(occ)
-
-        # ---- FINALIZE ----
+        # -----------------------------
+        # 4. Finalize
+        # -----------------------------
         self.search_points = deque(pts)
-        self.get_logger().info(f"Generated {len(pts)} search points across {len(rooms)} rooms.")
-        return pts
-
+        self.get_logger().info(
+            f"[ROOM SEARCH] {len(pts)} points across {len(rooms)} rooms"
+        )
+        self.publish_search_points()
 
     # ----------------- FALLBACK FUNCTION -----------------
     def _fallback_grid_sampling(self, occ):
@@ -1152,9 +1020,9 @@ class Task3(Node):
                     wx, wy = self.grid_to_world(gx, gy)
                     pts.append((wx, wy))
 
-        if len(pts) == 0:
-            self.get_logger().error("NO SEARCH POINTS FOUND IN FALLBACK. USING (0,0).")
-            pts = [(0, 0)]
+        if len(pts) == 0 and self.pose is not None:
+            self.get_logger().error("NO SEARCH POINTS FOUND — using robot position.")
+            pts = [(self.pose.position.x, self.pose.position.y)]
 
         self.search_points = deque(pts)
         self.get_logger().info(f"[DEBUG] Fallback generated {len(pts)} points.")
@@ -1317,39 +1185,53 @@ class Task3(Node):
     
 
     def assign_next_search_goal(self):
-        # If all balls found, stop search
         if len(self.found) >= 3:
             self.stop_robot()
             self.get_logger().info("All balls found — stopping search.")
             return
 
-        # If we have a manual RViz goal waiting, let it run
-        # (we prefer manual goal if set)
         if self.goal is not None:
             return
+        
+        if not self.search_points:
+            self.get_logger().warn("[SEARCH] No room points left — search again")
+            self.generate_search_points()
 
-        # Pop next search point
+        tried = 0
+        failed_plan = 0
+
         while self.search_points:
             x, y = self.search_points.popleft()
-            # Skip if point is too far or same as other found locations
-            # set as new goal
+            tried += 1
+
             ps = PoseStamped()
             ps.header.frame_id = "map"
             ps.pose.position.x = x
             ps.pose.position.y = y
             ps.pose.orientation.w = 1.0
             self.goal = ps
-            self.get_logger().info(f"New search goal: {x:.2f}, {y:.2f}")
-            # attempt to plan
+
+            self.get_logger().info(
+                f"[SEARCH] Trying point {tried}: ({x:.2f}, {y:.2f})"
+            )
+
             ok = self.plan_path()
             if ok:
+                self.get_logger().info(
+                    f"[SEARCH] ✔ Accepted search point ({x:.2f}, {y:.2f})"
+                )
                 return
             else:
-                # failed to plan to this search point, try next
+                failed_plan += 1
+                self.get_logger().warn(
+                    f"[SEARCH] ✘ Planning failed to ({x:.2f}, {y:.2f})"
+                )
                 self.goal = None
-                continue
 
-        self.get_logger().warn("Search points exhausted. No more points to try.")
+        self.get_logger().warn(
+            f"[SEARCH] Exhausted points | tried={tried}, failed_plan={failed_plan}"
+        )
+
 
     # ---------------- raycast ----------------
     def raycast_on_map(self, angle_cam):
@@ -1382,13 +1264,100 @@ class Task3(Node):
             else:
                 x, y = pos
                 self.get_logger().info(f"{color.upper()}: ({x:.2f}, {y:.2f})")
-                pt = Point(x, y, z=0.0)
+                pt = Point()
+                pt.x = float(x)
+                pt.y = float(y)
+                pt.z = 0.0
                 if color == "red":
                     self.red_pub.publish(pt)
                 elif color == "green":
                     self.green_pub.publish(pt)
                 elif color == "blue":
                     self.blue_pub.publish(pt)
+
+                # RViz marker
+                self.publish_ball_marker(x, y, color)
+        
+    
+    def publish_working_map(self, map):
+        if map is None:
+            return
+
+        msg = OccupancyGrid()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        msg.info.resolution = self.map_res
+        msg.info.width  = map.shape[1]
+        msg.info.height = map.shape[0]
+
+        msg.info.origin.position.x = self.map_origin[0]
+        msg.info.origin.position.y = self.map_origin[1]
+        msg.info.origin.orientation.w = 1.0
+
+        msg.data = (np.flipud(map).flatten() * 100).astype(np.int8).tolist()
+
+        self.work_map_pub.publish(msg)
+
+    def publish_ball_marker(self, x, y, color_name):
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "balls"
+        marker.id = {"red": 0, "green": 1, "blue": 2}[color_name]
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.07
+        marker.pose.orientation.w = 1.0
+
+        marker.scale.x = 0.15
+        marker.scale.y = 0.15
+        marker.scale.z = 0.15
+
+        # ✅ Correct ROS2 color assignment
+        marker.color = ColorRGBA()
+        marker.color.a = 1.0
+
+        if color_name == "red":
+            marker.color.r = 1.0
+        elif color_name == "green":
+            marker.color.g = 1.0
+        elif color_name == "blue":
+            marker.color.b = 1.0
+
+        marker.lifetime.sec = 0
+        marker.lifetime.nanosec = 0
+
+        self.marker_pub.publish(marker)
+
+    def publish_search_points(self):
+        m = Marker()
+        m.header.frame_id = "map"
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = "search"
+        m.id = 0
+        m.type = Marker.POINTS
+        m.action = Marker.ADD
+
+        m.scale.x = 0.1
+        m.scale.y = 0.1
+
+        m.color = ColorRGBA()
+        m.color.r = 1.0
+        m.color.g = 1.0
+        m.color.a = 1.0
+
+        for (x, y) in self.search_points:
+            p = Point()
+            p.x = x
+            p.y = y
+            p.z = 0.05
+            m.points.append(p)
+
+        self.search_marker_pub.publish(m)
 
 
 def main(args=None):
