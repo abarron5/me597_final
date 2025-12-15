@@ -133,7 +133,7 @@ class Task3(Node):
 
         # Camera image for detection
         self.bridge = CvBridge()
-        self.create_subscription(Image, '/camera/image_raw', self.cam_cb, cam_qos)
+        self.create_subscription(Image, '/camera/image_raw', self.cam_cb, cam_qos)zz
 
         # Publishers
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', qos)

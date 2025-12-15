@@ -17,9 +17,9 @@ import heapq
 INFLATE_RADIUS_CELLS = 5        # inflate obstacles by this many cells
 OCCUPIED_THRESH = 65            # map values >= this are occupied
 LOOKAHEAD_M = 0.30
-FRONT_OBSTACLE_THRESHOLD = 0.6  # m -> treat as obstacle blocking
-FRONT_ANGLE_DEG = 25             # degrees on each side for front sector
-MAX_LINEAR_SPEED = 0.16
+FRONT_OBSTACLE_THRESHOLD = 0.5  # m -> treat as obstacle blocking
+FRONT_ANGLE_DEG = 35             # degrees on each side for front sector
+MAX_LINEAR_SPEED = 0.2
 MAX_ANGULAR_SPEED = 0.8
 GOAL_NEAR_DIST_M = 0.25
 LIDAR_FORWARD_OFFSET = math.radians(0)
@@ -127,6 +127,8 @@ class Task2(Node):
         # Publishers
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', qos)
         self.path_pub = self.create_publisher(Path, 'global_plan', qos)
+        self.work_map_pub = self.create_publisher(OccupancyGrid, '/working_map', map_qos)
+
 
         # State
         self.map_msg = None
@@ -146,6 +148,13 @@ class Task2(Node):
 
         self.lidar = None              # last LaserScan
         self.ranges = None
+
+        # --- dynamic obstacle layer ---
+        self.dynamic_cost = None          # uint8 [0..100]
+        self.dynamic_add = 80             # cost per injection
+        self.dynamic_decay = 1            # cost removed per timer tick
+        self.dynamic_thresh = 40          # >= this -> obstacle
+
 
         # timer loop
         self.timer = self.create_timer(0.1, self.timer_cb)
@@ -178,8 +187,13 @@ class Task2(Node):
             binmap = np.zeros_like(arr, dtype=np.uint8)
             binmap[arr >= OCCUPIED_THRESH] = 1
             self.inf_map = self.inflate(binmap, INFLATE_RADIUS_CELLS)
+            self.publish_working_map(self.inf_map)
             self.map_loaded = True
             self.get_logger().info(f"Map received: size=({H},{W}), res={self.map_res:.3f}")
+
+            if self.dynamic_cost is None:
+                self.dynamic_cost = np.zeros_like(self.inf_map, dtype=np.uint8)
+
 
         except Exception as e:
             self.get_logger().error(f"Exception in map_cb: {e}")
@@ -212,6 +226,8 @@ class Task2(Node):
         # If map not yet loaded, wait
         if not self.map_loaded:
             return
+        
+        self.decay_dynamic_cost()
 
         # If we have no planned path, attempt to plan
         if self.global_path is None:
@@ -229,6 +245,15 @@ class Task2(Node):
 
         # follow path
         self.follow_path()
+
+    def decay_dynamic_cost(self):
+        if self.dynamic_cost is None:
+            return
+        self.dynamic_cost = np.maximum(
+            0,
+            self.dynamic_cost.astype(int) - self.dynamic_decay
+        ).astype(np.uint8)
+
 
     # ---------------- map helpers ----------------
     def inflate(self, binmap, radius_cells):
@@ -337,23 +362,19 @@ class Task2(Node):
         except Exception:
             self.get_logger().warn("start/goal outside inf_map bounds")
 
-        # working map for local replan
         working_map = self.inf_map.copy()
 
         if local_replan and self.is_obstacle_blocking_next_waypoint():
             ox, oy = self.find_closest_front_point()
             if ox is not None:
-                cgx, cgy = self.world_to_grid(ox, oy)
-                r = max(1, int(0.55 / self.map_res))   # radius in cells
-                for dx in range(-r, r + 1):
-                    for dy in range(-r, r + 1):
-                        # circle mask
-                        if dx*dx + dy*dy > r*r:
-                            continue
-                        nx = cgx + dx
-                        ny = cgy + dy
-                        if 0 <= nx < self.map_width and 0 <= ny < self.map_height:
-                            working_map[ny, nx] = 1
+                self.inject_dynamic_obstacle(ox, oy)
+
+        # convert dynamic cost -> binary obstacle layer
+        dyn_bin = (self.dynamic_cost >= self.dynamic_thresh).astype(np.uint8)
+        working_map = np.maximum(working_map, dyn_bin)
+
+        vis = np.maximum(self.inf_map * 100, self.dynamic_cost)
+        self.publish_working_map((vis >= 50).astype(np.uint8))
 
         # run A*
         path = self.astar_grid(start_g, goal_g, map_bin=working_map)
@@ -362,10 +383,6 @@ class Task2(Node):
             self.get_logger().warn("A* failed to find a path.")
             self.global_path = None
             self.path_world = []
-            self.stop_robot()
-            """speed = 0.0
-            heading = 0.1
-            self.move_ttbot_safe(speed, heading)"""
             return False
 
         # convert grid path to world coordinates and publish Path
@@ -396,7 +413,7 @@ class Task2(Node):
             return False
 
         idx = max(0, min(self.last_path_idx, len(self.path_world)-1))
-        next_idx = min(idx + 2, len(self.path_world)-1)
+        next_idx = min(idx + 4, len(self.path_world)-1)
         wx, wy = self.path_world[next_idx]
 
         rx, ry = self.pose.position.x, self.pose.position.y
@@ -439,6 +456,26 @@ class Task2(Node):
             if abs(angle_robot - bearing_to_way) <= math.radians(70):
                 return True
         return False
+    
+    def inject_dynamic_obstacle(self, wx, wy):
+        if self.dynamic_cost is None:
+            return
+
+        gx, gy = self.world_to_grid(wx, wy)
+        r = max(1, int(0.35 / self.map_res))
+
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if dx*dx + dy*dy > r*r:
+                    continue
+                x = gx + dx
+                y = gy + dy
+                if 0 <= x < self.map_width and 0 <= y < self.map_height:
+                    self.dynamic_cost[y, x] = min(
+                        100,
+                        self.dynamic_cost[y, x] + self.dynamic_add
+                    )
+
 
     def find_closest_front_point(self):
         if self.lidar is None:
@@ -496,22 +533,36 @@ class Task2(Node):
             self.stop_robot()
 
     def get_path_idx(self, path_world, last_idx=0):
-        """
-        Return next path index based on lookahead distance.
-        path_world: list of (x,y)
-        """
         if not path_world:
             return 0
+
         vx = self.pose.position.x
         vy = self.pose.position.y
-        lookahead = 0.3  # meters
+        lookahead = LOOKAHEAD_M
         n = len(path_world)
+
+        # --- 1) try to find the FIRST waypoint > lookahead ---
         for i in range(last_idx, n):
             px, py = path_world[i]
             dist = math.hypot(px - vx, py - vy)
             if dist > lookahead:
                 return i
-        return n - 1
+
+        # --- 2) If none, choose the nearest FORWARD waypoint ---
+        best_i = last_idx
+        best_d = 1e9
+        for i in range(last_idx, n):
+            px, py = path_world[i]
+            d = math.hypot(px - vx, py - vy)
+            if d < best_d:
+                best_d = d
+                best_i = i
+
+        # --- 3) Optionally step forward if we're basically at that point ---
+        if best_i < n - 1 and best_d < lookahead * 0.6:
+            return best_i + 1
+
+        return best_i
 
     def quat_to_yaw(self, q):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -576,6 +627,28 @@ class Task2(Node):
         lin = max(0.02, min(MAX_LINEAR_SPEED, lin))
 
         return lin, ang, dist
+    
+    def publish_working_map(self, map):
+        if map is None:
+            return
+
+        msg = OccupancyGrid()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        msg.info.resolution = self.map_res
+        msg.info.width  = map.shape[1]
+        msg.info.height = map.shape[0]
+
+        msg.info.origin.position.x = self.map_origin[0]
+        msg.info.origin.position.y = self.map_origin[1]
+        msg.info.origin.orientation.w = 1.0
+
+        msg.data = (np.flipud(map).flatten() * 100).astype(np.int8).tolist()
+
+        self.work_map_pub.publish(msg)
+
+
     
     def compute_obstacle_speed_limit(self):
         if self.ranges is None:
