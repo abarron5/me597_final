@@ -151,8 +151,6 @@ class Task3(Node):
         self.marker_pub = self.create_publisher(Marker, "/ball_markers", 10)
         self.search_marker_pub = self.create_publisher(Marker, "/search_points", 10)
 
-
-
         # State
         self.map_msg = None
         self.map_arr = None            # numpy array [H, W] flipped (row0 top)
@@ -208,7 +206,7 @@ class Task3(Node):
 
         # timer loops
         self.timer = self.create_timer(0.1, self.timer_cb)
-        self.status_timer = self.create_timer(1.0, self.print_ball_status)
+        self.status_timer = self.create_timer(10.0, self.print_ball_status)
 
         self.get_logger().info("Task3 node started (search + localize).")
 
