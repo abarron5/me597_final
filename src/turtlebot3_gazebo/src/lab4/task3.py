@@ -19,12 +19,12 @@ from cv_bridge import CvBridge
 import cv2 as cv
 
 # tuning
-INFLATE_RADIUS_CELLS = 6        # inflate obstacles by this many cells
+INFLATE_RADIUS_CELLS = 6        
 INFLATE_ROOM_RADIUS_CELLS = 10
-OCCUPIED_THRESH = 65            # map values >= this are occupied
+OCCUPIED_THRESH = 65           
 LOOKAHEAD_M = 0.30
-FRONT_OBSTACLE_THRESHOLD = 0.4  # m -> treat as obstacle blocking
-FRONT_ANGLE_DEG = 35             # degrees on each side for front sector
+FRONT_OBSTACLE_THRESHOLD = 0.4  
+FRONT_ANGLE_DEG = 35           
 MAX_LINEAR_SPEED = 0.2
 MAX_ANGULAR_SPEED = 0.8
 GOAL_NEAR_DIST_M = 0.25
@@ -35,10 +35,6 @@ ASTAR_MAX_EXPANSIONS = 400000
 
 
 class AStarGridSolver:
-    """Simple A* solver on an occupancy grid (0 free, 1 occupied).
-    Uses 8-connected neighbors by default but can be set to 4-connected.
-    Returns list of (gx,gy) nodes (gx=col, gy=row) or None if not found.
-    """
     def __init__(self, map_bin, use_diagonals=True):
         self.map = map_bin
         self.H, self.W = self.map.shape
@@ -153,29 +149,29 @@ class Task3(Node):
 
         # State
         self.map_msg = None
-        self.map_arr = None            # numpy array [H, W] flipped (row0 top)
+        self.map_arr = None          
         self.map_loaded = False
-        self.inf_map = None            # inflated binary map: 1->obstacle, 0->free
+        self.inf_map = None           
         self.room_map = None
         self.map_res = None
         self.map_origin = (0.0, 0.0)
         self.map_width = 0
         self.map_height = 0
 
-        self.pose = None               # geometry_msgs/Pose
-        self.goal = None               # PoseStamped
-        self.global_path = None        # nav_msgs/Path
-        self.path_world = []           # list of (x,y)
+        self.pose = None             
+        self.goal = None               
+        self.global_path = None      
+        self.path_world = []          
         self.last_path_idx = 0
 
-        self.lidar = None              # last LaserScan
+        self.lidar = None             
         self.ranges = None
 
         # --- dynamic obstacle layer ---
-        self.dynamic_cost = None          # uint8 [0..100]
-        self.dynamic_add = 80             # cost per injection
-        self.dynamic_decay = 4            # cost removed per timer tick
-        self.dynamic_thresh = 40          # >= this -> obstacle
+        self.dynamic_cost = None       
+        self.dynamic_add = 80            
+        self.dynamic_decay = 4           
+        self.dynamic_thresh = 40         
         self.obstacle_radius = 0.35
 
         # search-specific
@@ -210,7 +206,10 @@ class Task3(Node):
 
         self.get_logger().info("Task3 node started (search + localize).")
 
-    # ---------------- callbacks ----------------
+
+    # -----------------------------------------------------
+    #      CALLBACKS
+    # -----------------------------------------------------
     def map_cb(self, msg: OccupancyGrid):
         try:
             # defensive reshape: check sizes
@@ -252,9 +251,11 @@ class Task3(Node):
         except Exception as e:
             self.get_logger().error(f"Exception in map_cb: {e}")
 
+
     def amcl_cb(self, msg: PoseWithCovarianceStamped):
         # store Pose (geometry_msgs/Pose)
         self.pose = msg.pose.pose
+
 
     def goal_cb(self, msg: PoseStamped):
         # manual RViz goal still supported — it will override automatic search goal
@@ -265,97 +266,12 @@ class Task3(Node):
         ok = self.plan_path()
         self.get_logger().info(f"Plan result: {ok}")
 
+
     def scan_cb(self, msg: LaserScan):
         self.lidar = msg
         self.ranges = np.array(msg.ranges, dtype=float)
         self.ranges = np.where(np.isfinite(self.ranges), self.ranges, np.inf)
 
-    """def cam_cb(self, msg: Image):
-        # Camera callback: detect colored balls and localize using area-based distance
-        if self.pose is None or self.map_arr is None or len(self.found) >= 3:
-            return
-        
-        self.frame_count += 1
-        if self.frame_count % self.frame_skip != 0:
-            return
-        
-        try:
-            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except Exception as e:
-            self.get_logger().error(f"cv_bridge error: {e}")
-            return
-
-        hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
-        h, w = frame.shape[:2]
-        cx_frame = w // 2
-
-        # Camera constants
-        FOV = math.radians(62.2)
-        F = (w / 2) / math.tan(FOV / 2)     # focal length in pixels
-        BALL_RADIUS_M = 0.07                # 7 cm radius
-
-        for color, (lo, hi) in self.color_ranges.items():
-            if color in self.found:
-                continue
-
-            # Create mask
-            mask = cv.inRange(hsv, np.array(lo), np.array(hi))
-
-            # Clean noise
-            mask = cv.morphologyEx(mask, cv.MORPH_OPEN, np.ones((5, 5), np.uint8))
-            mask = cv.morphologyEx(mask, cv.MORPH_DILATE, np.ones((5, 5), np.uint8))
-
-            cnts, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-            if not cnts:
-                continue
-
-            # Largest blob
-            c = max(cnts, key=cv.contourArea)
-            area = cv.contourArea(c)
-            if area < 120:      # smaller threshold now that we're detecting at distance
-                continue
-
-            # Bounding box
-            x, y, bw, bh = cv.boundingRect(c)
-            cx = x + bw / 2
-            cy = y + bh / 2
-
-            # Pixel radius (approx)
-            radius_pixels = bw / 2
-            if radius_pixels < 4:
-                continue
-
-            # --- ANGLE from center of camera ---
-            angle = (cx - cx_frame) / cx_frame * (FOV / 2)
-
-            # --- DISTANCE using camera projection ---
-            distance = (BALL_RADIUS_M * F) / radius_pixels
-
-            # Robot pose
-            rx = self.pose.position.x
-            ry = self.pose.position.y
-            yaw = self.quat_to_yaw(self.pose.orientation)
-
-            # Ball world coordinates
-            bx = rx + distance * math.cos(yaw + angle)
-            by = ry + distance * math.sin(yaw + angle)
-
-            # Store it
-            self.found[color] = (bx, by)
-            self.detected_balls[color] = (bx, by)
-            self.get_logger().info(
-                f"FOUND {color.upper()} ball at ({bx:.2f}, {by:.2f}) | dist={distance:.2f} m"
-            )
-
-            if len(self.found) >= 3:
-                self.get_logger().info("All balls located — stopping robot.")
-                self.stop_robot()
-                self.global_path = None
-                self.path_world = []
-                self.goal = None
-
-            # Detect only one color per frame
-            break"""
     
     def cam_cb(self, msg: Image):
         """FAST + SIMPLE + RELIABLE camera callback based on working RedBallTracker logic."""
@@ -364,12 +280,11 @@ class Task3(Node):
         if self.pose is None or self.map_arr is None or len(self.found) >= 3:
             return
 
-        # Frame skipping BEFORE expensive work
-        self.frame_count += 1
+        """self.frame_count += 1
         if self.frame_count % self.frame_skip != 0:
-            return
+            return"""
 
-        # Convert ROS → CV
+        # Convert ROS to CV
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except:
@@ -383,13 +298,8 @@ class Task3(Node):
 
         # ---------- SAME LOGIC YOU KNOW WORKS ----------
         for color, (lo, hi) in self.color_ranges.items():
-            """if color in self.found:
-                continue"""
-
-            # Mask
             mask = cv.inRange(hsv, np.array(lo), np.array(hi))
 
-            # Clean-up mask (your working logic)
             mask = cv.morphologyEx(mask, cv.MORPH_OPEN, np.ones((5, 5), np.uint8))
             mask = cv.morphologyEx(mask, cv.MORPH_DILATE, np.ones((5, 5), np.uint8))
 
@@ -401,11 +311,10 @@ class Task3(Node):
             # Largest contour
             c = max(cnts, key=cv.contourArea)
             area = cv.contourArea(c)
-            #self.get_logger().info(f"Area: {area}")
 
             if area < self.min_ball_area:
                 continue
-            if area < 1.1 * self.best_area[color]:
+            if area < self.best_area[color]:
                 continue
             self.best_area[color] = area
 
@@ -451,7 +360,6 @@ class Task3(Node):
             break  # only detect one color per frame
 
 
-
     # ---------------- main loop ----------------
     def timer_cb(self):
         # need a pose to do anything
@@ -490,15 +398,10 @@ class Task3(Node):
         # follow path
         self.follow_path()
 
-    def decay_dynamic_cost(self):
-        if self.dynamic_cost is None:
-            return
-        self.dynamic_cost = np.maximum(
-            0,
-            self.dynamic_cost.astype(int) - self.dynamic_decay
-        ).astype(np.uint8)
 
-     # ---------------- map helpers ----------------
+    # -----------------------------------------------------
+    #      MAP HELPERS
+    # -----------------------------------------------------
     def inflate(self, binmap, radius_cells):
         H, W = binmap.shape
         inflated = binmap.copy()
@@ -521,6 +424,7 @@ class Task3(Node):
                     inflated[ny, nx] = 1
                     q.append((ny, nx))
         return inflated
+    
 
     def world_to_grid(self, wx, wy):
         """Convert world (x,y) to grid indices (gx,gy) where gx=col, gy=row"""
@@ -529,6 +433,7 @@ class Task3(Node):
         j = int((wx - ox) / res)   # column (gx)
         i = self.map_height - int((wy - oy) / res) - 1  # row (gy)
         return j, i
+    
 
     def grid_to_world(self, gx, gy):
         ox, oy = self.map_origin
@@ -537,43 +442,9 @@ class Task3(Node):
         y = (self.map_height - gy - 1) * res + oy + res/2.0
         return x, y
 
-    def find_nearest_free(self, g):
-        """BFS to nearest free cell on self.inf_map. Input and output are (gx,gy)."""
-        from collections import deque
-        if self.inf_map is None:
-            return g
-        start_gx, start_gy = g
-        W = self.map_width
-        H = self.map_height
-        if 0 <= start_gx < W and 0 <= start_gy < H and self.inf_map[start_gy, start_gx] == 0:
-            return (start_gx, start_gy)
-        q = deque([(start_gx, start_gy)])
-        visited = set([(start_gx, start_gy)])
-        while q:
-            gx, gy = q.popleft()
-            for dx in [-1,0,1]:
-                for dy in [-1,0,1]:
-                    nx, ny = gx + dx, gy + dy
-                    if not (0 <= nx < W and 0 <= ny < H):
-                        continue
-                    if (nx, ny) in visited:
-                        continue
-                    visited.add((nx, ny))
-                    if self.inf_map[ny, nx] == 0:
-                        return (nx, ny)
-                    q.append((nx, ny))
-        return (start_gx, start_gy)
-
-    # ---------------- A* planner (grid) ----------------
-    def astar_grid(self, start_g, goal_g, map_bin=None):
-        if map_bin is None:
-            map_bin = self.inf_map
-        if map_bin is None:
-            return None
-        solver = AStarGridSolver(map_bin, use_diagonals=True)
-        path = solver.solve(start_g, goal_g)
-        return path
-
+    # -----------------------------------------------------
+    #      PATH PLANNING
+    # -----------------------------------------------------
     # ---------------- planning / replanning ----------------
     def plan_path(self, local_replan=False):
         if not self.map_loaded or self.pose is None or self.goal is None:
@@ -653,27 +524,87 @@ class Task3(Node):
         self.path_pub.publish(self.global_path)
         self.get_logger().info(f"A* planned path with {len(self.path_world)} waypoints.")
         return True
+    
 
-    # ---------------- obstacle helpers ----------------
-    def inject_dynamic_obstacle(self, wx, wy):
-        if self.dynamic_cost is None:
-            return
+    def find_nearest_free(self, g):
+        """BFS to nearest free cell on self.inf_map. Input and output are (gx,gy)."""
+        from collections import deque
+        if self.inf_map is None:
+            return g
+        start_gx, start_gy = g
+        W = self.map_width
+        H = self.map_height
+        if 0 <= start_gx < W and 0 <= start_gy < H and self.inf_map[start_gy, start_gx] == 0:
+            return (start_gx, start_gy)
+        q = deque([(start_gx, start_gy)])
+        visited = set([(start_gx, start_gy)])
+        while q:
+            gx, gy = q.popleft()
+            for dx in [-1,0,1]:
+                for dy in [-1,0,1]:
+                    nx, ny = gx + dx, gy + dy
+                    if not (0 <= nx < W and 0 <= ny < H):
+                        continue
+                    if (nx, ny) in visited:
+                        continue
+                    visited.add((nx, ny))
+                    if self.inf_map[ny, nx] == 0:
+                        return (nx, ny)
+                    q.append((nx, ny))
+        return (start_gx, start_gy)
+    
+    
+    def find_closest_front_point(self):
+        if self.lidar is None:
+            return (None, None)
+        angle_min = self.lidar.angle_min
+        angle_inc = self.lidar.angle_increment
+        N = len(self.ranges)
+        w = math.radians(FRONT_ANGLE_DEG)
 
-        gx, gy = self.world_to_grid(wx, wy)
-        r = max(1, int(self.obstacle_radius / self.map_res))
+        center = LIDAR_FORWARD_OFFSET
+        idx0 = int((center - w - angle_min) / angle_inc)
+        idx1 = int((center + w - angle_min) / angle_inc)
+        idx0 = max(0, min(N-1, idx0))
+        idx1 = max(0, min(N-1, idx1))
+        sector = self.ranges[idx0:idx1+1]
+        
 
-        for dx in range(-r, r + 1):
-            for dy in range(-r, r + 1):
-                if dx*dx + dy*dy > r*r:
-                    continue
-                x = gx + dx
-                y = gy + dy
-                if 0 <= x < self.map_width and 0 <= y < self.map_height:
-                    self.dynamic_cost[y, x] = min(
-                        100,
-                        self.dynamic_cost[y, x] + self.dynamic_add
-                    )
+        if sector.size == 0:
+            return (None, None)
+        rel_idx = int(np.argmin(sector))
+        overall_idx = idx0 + rel_idx
+        r = float(self.ranges[overall_idx])
+        if not math.isfinite(r) or r > 5.0:
+            return (None, None)
+        angle_lidar = angle_min + overall_idx * angle_inc
+        angle_corrected = angle_lidar + LIDAR_FORWARD_OFFSET
 
+        rx = r * math.cos(angle_corrected)
+        ry = r * math.sin(angle_corrected)
+
+        robot_x = self.pose.position.x
+        robot_y = self.pose.position.y
+        robot_yaw = self.quat_to_yaw(self.pose.orientation)
+        wx = robot_x + (rx * math.cos(robot_yaw) - ry * math.sin(robot_yaw))
+        wy = robot_y + (rx * math.sin(robot_yaw) + ry * math.cos(robot_yaw))
+        return (wx, wy)
+    
+
+    # ---------------- A* planner (grid) ----------------
+    def astar_grid(self, start_g, goal_g, map_bin=None):
+        if map_bin is None:
+            map_bin = self.inf_map
+        if map_bin is None:
+            return None
+        solver = AStarGridSolver(map_bin, use_diagonals=True)
+        path = solver.solve(start_g, goal_g)
+        return path
+
+
+    # -----------------------------------------------------
+    #      OBSTACLE AVOIDANCE
+    # -----------------------------------------------------
     def is_obstacle_blocking_next_waypoint(self):
         if self.lidar is None or not self.path_world:
             return False
@@ -723,43 +654,39 @@ class Task3(Node):
                 return True
         return False
 
-    def find_closest_front_point(self):
-        if self.lidar is None:
-            return (None, None)
-        angle_min = self.lidar.angle_min
-        angle_inc = self.lidar.angle_increment
-        N = len(self.ranges)
-        w = math.radians(FRONT_ANGLE_DEG)
 
-        center = LIDAR_FORWARD_OFFSET
-        idx0 = int((center - w - angle_min) / angle_inc)
-        idx1 = int((center + w - angle_min) / angle_inc)
-        idx0 = max(0, min(N-1, idx0))
-        idx1 = max(0, min(N-1, idx1))
-        sector = self.ranges[idx0:idx1+1]
-        
+    def inject_dynamic_obstacle(self, wx, wy):
+        if self.dynamic_cost is None:
+            return
 
-        if sector.size == 0:
-            return (None, None)
-        rel_idx = int(np.argmin(sector))
-        overall_idx = idx0 + rel_idx
-        r = float(self.ranges[overall_idx])
-        if not math.isfinite(r) or r > 5.0:
-            return (None, None)
-        angle_lidar = angle_min + overall_idx * angle_inc
-        angle_corrected = angle_lidar + LIDAR_FORWARD_OFFSET
+        gx, gy = self.world_to_grid(wx, wy)
+        r = max(1, int(self.obstacle_radius / self.map_res))
 
-        rx = r * math.cos(angle_corrected)
-        ry = r * math.sin(angle_corrected)
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if dx*dx + dy*dy > r*r:
+                    continue
+                x = gx + dx
+                y = gy + dy
+                if 0 <= x < self.map_width and 0 <= y < self.map_height:
+                    self.dynamic_cost[y, x] = min(
+                        100,
+                        self.dynamic_cost[y, x] + self.dynamic_add
+                    )
 
-        robot_x = self.pose.position.x
-        robot_y = self.pose.position.y
-        robot_yaw = self.quat_to_yaw(self.pose.orientation)
-        wx = robot_x + (rx * math.cos(robot_yaw) - ry * math.sin(robot_yaw))
-        wy = robot_y + (rx * math.sin(robot_yaw) + ry * math.cos(robot_yaw))
-        return (wx, wy)
+    
+    def decay_dynamic_cost(self):
+        if self.dynamic_cost is None:
+            return
+        self.dynamic_cost = np.maximum(
+            0,
+            self.dynamic_cost.astype(int) - self.dynamic_decay
+        ).astype(np.uint8)
 
-    # ---------------- path following ----------------
+
+    # -----------------------------------------------------
+    #      PATH FOLLOWING
+    # -----------------------------------------------------
     def follow_path(self):
         if not self.path_world:
             return
@@ -778,6 +705,7 @@ class Task3(Node):
             self.goal = None
             self.stop_robot()
 
+
     def get_path_idx(self, path_world, last_idx=0):
         """
         Return next path index based on lookahead distance.
@@ -795,11 +723,13 @@ class Task3(Node):
             if dist > lookahead:
                 return i
         return n - 1
+    
 
     def quat_to_yaw(self, q):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y*q.y + q.z*q.z)
         return math.atan2(siny_cosp, cosy_cosp)
+    
 
     def path_follower_from_xy(self, goal_x, goal_y):
         # Current pose
@@ -847,10 +777,6 @@ class Task3(Node):
         speed_factor = 1.0 - min(0.8, abs(ang) * 1.2)
         lin = MAX_LINEAR_SPEED * speed_factor
 
-        # Apply obstacle-based limit
-        """obs_lim = self.compute_obstacle_speed_limit()
-        lin = min(lin, obs_lim)"""
-
         # Safety slowdown on close path points
         if dist < 0.20:
             lin = min(lin, 0.06)
@@ -860,42 +786,6 @@ class Task3(Node):
 
         return lin, ang, dist
     
-    def compute_obstacle_speed_limit(self):
-        if self.ranges is None:
-            return MAX_LINEAR_SPEED
-
-        angle_min = self.lidar.angle_min
-        angle_inc = self.lidar.angle_increment
-        N = len(self.ranges)
-
-        # Use a much wider arc than obstacle detection
-        left = math.radians(70)
-        right = math.radians(-70)
-
-        idx0 = int((right - angle_min) / angle_inc)
-        idx1 = int((left  - angle_min) / angle_inc)
-
-        idx0 = max(0, min(N-1, idx0))
-        idx1 = max(0, min(N-1, idx1))
-
-        sector = self.ranges[idx0:idx1+1]
-        if sector.size == 0:
-            return MAX_LINEAR_SPEED
-
-        d = float(np.min(sector))
-        self.get_logger().info(f"Minimum distance: {d}")
-
-        # Convert distance to speed limits
-        if d > 1.5:
-            return MAX_LINEAR_SPEED
-        elif d > 1.0:
-            return 0.12
-        elif d > 0.7:
-            return 0.08
-        elif d > 0.4:
-            return 0.04
-        else:
-            return 0.0
 
     def move_ttbot_safe(self, speed, heading):
         cmd = Twist()
@@ -909,27 +799,17 @@ class Task3(Node):
         cmd.angular.z = 0.0
         self.cmd_pub.publish(cmd)
 
-    # ---------------- search helpers ---------------- 
-    def generate_search_points(self):
-        """
-        ROOM-BASED SEARCH (CLEAN + ROBUST)
-        ---------------------------------
-        - Uses inflated map for safety
-        - Uses EXTRA inflation to close doorways
-        - Finds rooms via connected components
-        - Chooses 1–2 interior points per room
-        """
 
+    # -----------------------------------------------------
+    #      SEARCH POINTS
+    # -----------------------------------------------------
+    def generate_search_points(self):
         if self.room_map is None:
             self.get_logger().warn("generate_search_points(): map not ready")
             return
 
-        # -----------------------------
-        # 2. Connected components = rooms
-        # -----------------------------
         free = (self.room_map == 0).astype(np.uint8)
         num_labels, labels = cv.connectedComponents(free)
-
 
         rooms = []
         for lab in range(1, num_labels):
@@ -957,13 +837,8 @@ class Task3(Node):
             self.get_logger().warn("Room detection failed — falling back to coarse grid")
             return self._fallback_grid_sampling(self.inf_map)
 
-
-        # Sort rooms left → right
         rooms.sort(key=lambda r: r["cx"])
 
-        # -----------------------------
-        # 3. Choose points per room
-        # -----------------------------
         pts = []
 
         for r in rooms:
@@ -974,7 +849,6 @@ class Task3(Node):
             x_min, x_max = xs.min(), xs.max()
             y_min, y_max = ys.min(), ys.max()
 
-            # how many points?
             if size < 3000:
                 samples = 1
             else:
@@ -994,14 +868,12 @@ class Task3(Node):
                 wx, wy = self.grid_to_world(gx, gy)
                 pts.append((wx, wy))
 
-        # -----------------------------
-        # 4. Finalize
-        # -----------------------------
         self.search_points = deque(pts)
         self.get_logger().info(
             f"[ROOM SEARCH] {len(pts)} points across {len(rooms)} rooms"
         )
         self.publish_search_points()
+
 
     # ----------------- FALLBACK FUNCTION -----------------
     def _fallback_grid_sampling(self, occ):
@@ -1026,16 +898,8 @@ class Task3(Node):
         self.get_logger().info(f"[DEBUG] Fallback generated {len(pts)} points.")
         return pts
     
-    def generate_search_points_slow(self):
-        """
-        Deterministic room-by-room sweeping search with hallway merging.
-        - Uses RAW occupancy map (not inflated) for proper segmentation.
-        - free = occ < 50
-        - connected components → rooms
-        - hallways merged into nearest large room
-        - 3×3 interior grid samples per room
-        """
 
+    def generate_search_points_slow(self):
         if self.map_arr is None:
             self.get_logger().warn("generate_search_points(): map_arr not ready")
             return
@@ -1043,16 +907,10 @@ class Task3(Node):
         occ = self.map_arr  # H × W, raw occupancy
         H, W = occ.shape
 
-        # --------------------------
-        # 1. Build free-space mask
-        # --------------------------
         free_mask = ((occ >= 0) & (occ < 50)).astype(np.uint8)
         free_count = int(free_mask.sum())
         self.get_logger().info(f"[DEBUG] free_mask ready: free_count={free_count}")
 
-        # --------------------------
-        # 2. Connected components
-        # --------------------------
         num_labels, labels = cv.connectedComponents(free_mask)
         self.get_logger().info(f"[DEBUG] Connected components detected: {num_labels}")
 
@@ -1094,9 +952,6 @@ class Task3(Node):
             self.get_logger().error("No valid rooms detected. Map may be too open.")
             return
 
-        # --------------------------
-        # 3. Merge hallways into nearest room
-        # --------------------------
         merged_regions = []
 
         # Convert regions to dicts for merging
@@ -1132,16 +987,9 @@ class Task3(Node):
         # final rooms list
         final_rooms = room_data
 
-        # --------------------------
-        # 4. Sort rooms left → right
-        # --------------------------
         final_rooms.sort(key=lambda r: r["cx"])
         self.get_logger().info(f"[DEBUG] Final room count after merge: {len(final_rooms)}")
 
-        # --------------------------
-        # 5. Generate search points
-        #     3×3 interior grid per room
-        # --------------------------
         search_points = []
 
         for r in final_rooms:
@@ -1180,7 +1028,6 @@ class Task3(Node):
             f"Generated {len(search_points)} deterministic search points across {len(final_rooms)} rooms (hallways merged)."
         )
 
-    
 
     def assign_next_search_goal(self):
         if len(self.found) >= 3:
@@ -1231,29 +1078,9 @@ class Task3(Node):
         )
 
 
-    # ---------------- raycast ----------------
-    def raycast_on_map(self, angle_cam):
-        """
-        Raycast on occupancy grid along robot_yaw + angle_cam.
-        Returns distance in meters to first occupied cell; None if none hit.
-        """
-        if self.map_arr is None or self.pose is None:
-            return None
-        gx, gy = self.world_to_grid(self.pose.position.x, self.pose.position.y)
-        yaw = self.quat_to_yaw(self.pose.orientation)
-        ang = yaw + angle_cam
-
-        # step in cells (integer ray march). use small step for better accuracy if needed
-        max_steps = int(12.0 / self.map_res)  # up to 12 meters
-        for i in range(1, max_steps):
-            rx = gx + int(round(i * math.cos(ang)))
-            ry = gy + int(round(i * math.sin(ang)))
-            if rx < 0 or ry < 0 or ry >= self.map_height or rx >= self.map_width:
-                return None
-            if self.map_arr[ry, rx] >= OCCUPIED_THRESH:
-                return i * self.map_res
-        return None
-    
+    # -----------------------------------------------------
+    #      PRINT/PUBLISH
+    # -----------------------------------------------------    
     def print_ball_status(self):
         self.get_logger().info("==== BALL LOCALIZATION STATUS ====")
         for color, pos in self.detected_balls.items():
@@ -1297,6 +1124,7 @@ class Task3(Node):
 
         self.work_map_pub.publish(msg)
 
+
     def publish_ball_marker(self, x, y, color_name):
         marker = Marker()
         marker.header.frame_id = "map"
@@ -1315,7 +1143,6 @@ class Task3(Node):
         marker.scale.y = 0.15
         marker.scale.z = 0.15
 
-        # ✅ Correct ROS2 color assignment
         marker.color = ColorRGBA()
         marker.color.a = 1.0
 
@@ -1330,6 +1157,7 @@ class Task3(Node):
         marker.lifetime.nanosec = 0
 
         self.marker_pub.publish(marker)
+
 
     def publish_search_points(self):
         m = Marker()

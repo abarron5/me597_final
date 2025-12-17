@@ -662,8 +662,8 @@ class Task1(Node):
                 # convert to world coords
                 self.current_path_world = [self.grid_to_world(x, y) for x, y in path]
                 # smooth path for better following (use small window)
-                if self.path_has_clearance(self.current_path, min_clear_cells=2):
-                    self.current_path_world = self.smooth_path(self.current_path_world, window=0)
+                """if self.path_has_clearance(self.current_path, min_clear_cells=2):
+                    self.current_path_world = self.smooth_path(self.current_path_world, window=0)"""
 
                 # store frontier (not safe target)
                 self.path_goal = frontier

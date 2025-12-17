@@ -278,7 +278,6 @@ class Task2(Node):
             # temporary injection and replan handled inside plan_path()
             #self.stop_robot()
             self.plan_path(local_replan=True)
-            return
 
         # follow path
         self.follow_path()
@@ -363,10 +362,13 @@ class Task2(Node):
 
         working_map = self.inf_map.copy()
 
-        if local_replan and self.is_obstacle_blocking_next_waypoint():
+        """if local_replan and self.is_obstacle_blocking_next_waypoint():
             ox, oy = self.find_closest_front_point()
             if ox is not None:
-                self.inject_dynamic_obstacle(ox, oy)
+                self.inject_dynamic_obstacle(ox, oy)"""
+        
+        if local_replan and self.is_obstacle_blocking_next_waypoint():
+            self.inject_front_obstacle_band()
 
         # convert dynamic cost -> binary obstacle layer
         dyn_bin = (self.dynamic_cost >= self.dynamic_thresh).astype(np.uint8)
@@ -440,6 +442,7 @@ class Task2(Node):
         w = math.radians(FRONT_ANGLE_DEG)
 
         center = LIDAR_FORWARD_OFFSET
+        
         idx0 = int((center - w - angle_min) / angle_inc)
         idx1 = int((center + w - angle_min) / angle_inc)
         idx0 = max(0, min(N-1, idx0))
@@ -516,8 +519,8 @@ class Task2(Node):
 
         if sector.size == 0:
             return False
-        self.min_front = float(np.min(sector))
-        self.get_logger().info(f"Minimum distance: {self.min_front}")
+        self.front_dist = float(np.min(sector))
+        self.get_logger().info(f"Minimum distance: {self.front_dist}")
         if self.front_dist < EARLY_DETECT_DIST:
             #return True
             rel_idx = int(np.argmin(sector))
@@ -548,6 +551,7 @@ class Task2(Node):
             else:
                 return (d - 0.35) / (0.9 - 0.35)
             
+            
     def obstacle_steering_bias(self):
         if self.front_dist > EARLY_DETECT_DIST:
             return 0.0
@@ -575,7 +579,47 @@ class Task2(Node):
                         100,
                         self.dynamic_cost[y, x] + self.dynamic_add
                     )
+            
     
+    def inject_front_obstacle_band(self):
+        if self.lidar is None or self.ranges is None:
+            return
+
+        angle_min = self.lidar.angle_min
+        angle_inc = self.lidar.angle_increment
+        N = len(self.ranges)
+
+        w = math.radians(FRONT_ANGLE_DEG)
+        center = 0.0  # robot forward
+        idx0 = int((center - w - angle_min) / angle_inc)
+        idx1 = int((center + w - angle_min) / angle_inc)
+
+        idx0 = max(0, min(N - 1, idx0))
+        idx1 = max(0, min(N - 1, idx1))
+
+        robot_x = self.pose.position.x
+        robot_y = self.pose.position.y
+        robot_yaw = self.quat_to_yaw(self.pose.orientation)
+
+        for i in range(idx0, idx1 + 1, 3):  # step=3 keeps cost reasonable
+            r = self.ranges[i]
+            if not math.isfinite(r):
+                continue
+            if r > EARLY_DETECT_DIST:
+                continue
+
+            angle_lidar = angle_min + i * angle_inc
+            angle_robot = angle_lidar
+
+            inject_dist = min(r + 0.15, PROJECT_DIST)
+            rx = inject_dist * math.cos(angle_robot)
+            ry = inject_dist * math.sin(angle_robot)
+
+            wx = robot_x + (rx * math.cos(robot_yaw) - ry * math.sin(robot_yaw))
+            wy = robot_y + (rx * math.sin(robot_yaw) + ry * math.cos(robot_yaw))
+
+            self.inject_dynamic_obstacle(wx, wy)
+
 
     def decay_dynamic_cost(self):
         if self.dynamic_cost is None:
